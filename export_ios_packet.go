@@ -82,7 +82,15 @@ func OpenFluxStartPacketTunnel(transportType, url, maxToken, maxUid *C.char, tun
 	var t transport.Transport
 	switch tt {
 	case "yandex", "":
-		t = transport.NewCompressedTransport(yandex.NewYandexDocsTransport(docURL, config))
+		// docURL may hold several comma-separated Yandex documents; fan them
+		// out into one channel (MultiTransport) for throughput + resilience.
+		// Must match the exit node's document set exactly.
+		urls := splitDocURLs(docURL)
+		subs := make([]transport.Transport, len(urls))
+		for i, u := range urls {
+			subs[i] = yandex.NewYandexDocsTransport(u, config)
+		}
+		t = transport.NewCompressedTransport(transport.NewMultiTransport(subs))
 	case "oneme":
 		uidint, _ := strconv.ParseInt(mUid, 10, 64)
 		t = transport.NewCompressedTransport(oneme.NewOneMeTransport(false, mToken, uidint, config))

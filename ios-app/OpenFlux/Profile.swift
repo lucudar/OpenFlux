@@ -1,32 +1,85 @@
 import Foundation
 
-/// A saved connection profile: one transport + its document/credentials.
-/// Multiple profiles let the user keep several Yandex documents (or a MAX
-/// config) and switch between them from the main screen.
+/// A saved connection profile: one transport + its document(s)/credentials.
+/// A Yandex profile can hold SEVERAL documents — they are fanned out into one
+/// logical channel on both client and exit (MultiTransport) for more
+/// throughput and resilience. The exit node must be configured with the SAME
+/// set of documents in the same order.
 struct Profile: Identifiable, Codable, Equatable {
     var id: UUID = UUID()
     var name: String
     var transport: String   // "yandex" | "oneme"
-    var url: String         // Yandex document URL (yandex)
+    var urls: [String]      // Yandex document URLs (one or more)
     var maxToken: String    // MAX token (oneme)
     var maxUid: String      // MAX user id (oneme)
 
     init(id: UUID = UUID(), name: String, transport: String = "yandex",
-         url: String = "", maxToken: String = "", maxUid: String = "") {
+         urls: [String] = [], maxToken: String = "", maxUid: String = "") {
         self.id = id
         self.name = name
         self.transport = transport
-        self.url = url
+        self.urls = urls
         self.maxToken = maxToken
         self.maxUid = maxUid
     }
+
+    // Backward-compatible decode: earlier builds stored a single `url` string.
+    private enum CodingKeys: String, CodingKey {
+        case id, name, transport, urls, url, maxToken, maxUid
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = (try? c.decode(UUID.self, forKey: .id)) ?? UUID()
+        name = (try? c.decode(String.self, forKey: .name)) ?? "Профиль"
+        transport = (try? c.decode(String.self, forKey: .transport)) ?? "yandex"
+        maxToken = (try? c.decode(String.self, forKey: .maxToken)) ?? ""
+        maxUid = (try? c.decode(String.self, forKey: .maxUid)) ?? ""
+        if let arr = try? c.decode([String].self, forKey: .urls) {
+            urls = arr
+        } else if let single = try? c.decode(String.self, forKey: .url) {
+            urls = single.isEmpty ? [] : [single]
+        } else {
+            urls = []
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(name, forKey: .name)
+        try c.encode(transport, forKey: .transport)
+        try c.encode(urls, forKey: .urls)
+        try c.encode(maxToken, forKey: .maxToken)
+        try c.encode(maxUid, forKey: .maxUid)
+    }
+
+    /// Non-empty, trimmed document URLs.
+    var cleanURLs: [String] {
+        urls.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+    }
+
+    /// Comma-separated URL list passed to the Go layer (splitDocURLs parses it).
+    var joinedURLs: String { cleanURLs.joined(separator: ",") }
+
+    /// First URL, for compact one-line display.
+    var primaryURL: String { cleanURLs.first ?? "" }
 
     /// Whether this profile has enough info to connect.
     var isComplete: Bool {
         switch transport {
         case "oneme": return !maxToken.isEmpty && !maxUid.isEmpty
-        default:      return !url.trimmingCharacters(in: .whitespaces).isEmpty
+        default:      return !cleanURLs.isEmpty
         }
+    }
+
+    /// Short human summary of the transport target for the profile row.
+    var subtitle: String {
+        if transport == "oneme" { return "MAX • uid \(maxUid)" }
+        let n = cleanURLs.count
+        if n == 0 { return "нет документов" }
+        if n == 1 { return primaryURL }
+        return "\(n) документа • \(primaryURL)"
     }
 }
 

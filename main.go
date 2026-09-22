@@ -281,11 +281,32 @@ DEPRECATED (removed in v2)
 	config := transport.DefaultConfig()
 	var inner transport.Transport
 
+	// A comma-separated --url is a set of Yandex documents fanned out into one
+	// logical channel (see transport.MultiTransport): more parallel WebSockets
+	// = more throughput and no single-doc stall. Client and exit MUST list the
+	// SAME documents in the SAME order. A single URL yields a single sub, so
+	// the MultiTransport wrapper is transparent in that case.
+	docURLs := splitDocURLs(globalDocUrl)
+
 	switch *transportType {
 	case "vyandex":
-		inner = yandex.NewYandexVolgaTransport(globalDocUrl, config)
+		subs := make([]transport.Transport, len(docURLs))
+		for i, u := range docURLs {
+			subs[i] = yandex.NewYandexVolgaTransport(u, config)
+		}
+		inner = transport.NewMultiTransport(subs)
+		if len(subs) > 1 {
+			log.Printf("Multi-document: %d Yandex channels (vyandex)", len(subs))
+		}
 	case "yandex":
-		inner = yandex.NewYandexDocsTransport(globalDocUrl, config)
+		subs := make([]transport.Transport, len(docURLs))
+		for i, u := range docURLs {
+			subs[i] = yandex.NewYandexDocsTransport(u, config)
+		}
+		inner = transport.NewMultiTransport(subs)
+		if len(subs) > 1 {
+			log.Printf("Multi-document: %d Yandex channels", len(subs))
+		}
 	case "oneme":
 		uidint, _ := strconv.ParseInt(maxUid, 10, 64)
 		inner = oneme.NewOneMeTransport(*role == roleExit, maxToken, uidint, config)
@@ -442,4 +463,24 @@ func runClientTUN(trans transport.Transport) {
 	tc.RestoreDefault()
 	log.Printf("Shutdown complete")
 	os.Exit(0)
+}
+
+// splitDocURLs parses a --url value that may hold several documents separated
+// by commas (or whitespace) into a clean list. Empty entries are dropped; a
+// value with no separators yields a single-element list, so single-document
+// setups are unaffected.
+func splitDocURLs(raw string) []string {
+	fields := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == '\n' || r == ' ' || r == '\t'
+	})
+	out := make([]string, 0, len(fields))
+	for _, f := range fields {
+		if s := strings.TrimSpace(f); s != "" {
+			out = append(out, s)
+		}
+	}
+	if len(out) == 0 {
+		out = append(out, strings.TrimSpace(raw))
+	}
+	return out
 }

@@ -167,7 +167,14 @@ func OpenFluxStartClient(transportType, url, socksAddr, maxToken, maxUid *C.char
 	var t transport.Transport
 	switch tt {
 	case "yandex", "":
-		t = transport.NewCompressedTransport(yandex.NewYandexDocsTransport(docURL, config))
+		// Comma-separated docURL = several Yandex documents fanned into one
+		// channel (must match the exit's set). Single URL = single sub.
+		urls := splitDocURLs(docURL)
+		subs := make([]transport.Transport, len(urls))
+		for i, u := range urls {
+			subs[i] = yandex.NewYandexDocsTransport(u, config)
+		}
+		t = transport.NewCompressedTransport(transport.NewMultiTransport(subs))
 	case "oneme":
 		uidint, _ := strconv.ParseInt(mUid, 10, 64)
 		t = transport.NewCompressedTransport(oneme.NewOneMeTransport(false, mToken, uidint, config))

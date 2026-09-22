@@ -85,7 +85,7 @@ struct SettingsView: View {
                             .foregroundColor(p.id == store.selectedID ? .green : .secondary)
                         VStack(alignment: .leading, spacing: 2) {
                             Text(p.name).foregroundColor(.primary)
-                            Text(p.transport == "oneme" ? "MAX • uid \(p.maxUid)" : p.url)
+                            Text(p.subtitle)
                                 .font(.caption).foregroundColor(.secondary)
                                 .lineLimit(1).truncationMode(.middle)
                         }
@@ -148,7 +148,7 @@ struct SettingsView: View {
                 Button {
                     guard let p = store.selected else { return }
                     let kind = TransportKind(rawValue: p.transport) ?? .yandex
-                    tunnel.start(transport: kind, url: p.url,
+                    tunnel.start(transport: kind, url: p.joinedURLs,
                                  maxToken: p.maxToken, maxUid: p.maxUid,
                                  port: Int(socksPort) ?? 10808)
                 } label: {
@@ -180,13 +180,14 @@ struct SettingsView: View {
     }
 }
 
-/// Add or edit a single profile.
+/// Add or edit a single profile. A Yandex profile may hold several document
+/// URLs — they are fanned out into one connection (more speed + resilience).
 struct ProfileEditor: View {
     @Environment(\.dismiss) private var dismiss
 
     @State private var name: String
     @State private var transport: String
-    @State private var url: String
+    @State private var urls: [String]
     @State private var maxToken: String
     @State private var maxUid: String
     private let id: UUID
@@ -196,10 +197,16 @@ struct ProfileEditor: View {
         self.id = profile?.id ?? UUID()
         _name = State(initialValue: profile?.name ?? "")
         _transport = State(initialValue: profile?.transport ?? "yandex")
-        _url = State(initialValue: profile?.url ?? "")
+        // Always keep at least one editable row.
+        let existing = profile?.urls.filter { !$0.isEmpty } ?? []
+        _urls = State(initialValue: existing.isEmpty ? [""] : existing)
         _maxToken = State(initialValue: profile?.maxToken ?? "")
         _maxUid = State(initialValue: profile?.maxUid ?? "")
         self.onSave = onSave
+    }
+
+    private var canSave: Bool {
+        !name.trimmingCharacters(in: .whitespaces).isEmpty
     }
 
     var body: some View {
@@ -224,11 +231,7 @@ struct ProfileEditor: View {
                             .keyboardType(.numberPad)
                     }
                 } else {
-                    Section("Yandex Docs URL") {
-                        TextField("https://disk.yandex.ru/i/...", text: $url)
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled(true)
-                    }
+                    yandexDocsSection
                 }
             }
             .navigationTitle("Профиль")
@@ -238,20 +241,53 @@ struct ProfileEditor: View {
                     Button("Отмена") { dismiss() }
                 }
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    Button("Сохранить") {
-                        let finalName = name.trimmingCharacters(in: .whitespaces)
-                        onSave(Profile(
-                            id: id,
-                            name: finalName.isEmpty ? "Профиль" : finalName,
-                            transport: transport,
-                            url: url.trimmingCharacters(in: .whitespaces),
-                            maxToken: maxToken.trimmingCharacters(in: .whitespaces),
-                            maxUid: maxUid.trimmingCharacters(in: .whitespaces)))
-                        dismiss()
-                    }
-                    .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
+                    Button("Сохранить") { save() }.disabled(!canSave)
                 }
             }
         }
+    }
+
+    private var yandexDocsSection: some View {
+        Section {
+            ForEach(urls.indices, id: \.self) { i in
+                HStack {
+                    Image(systemName: "doc.text")
+                        .foregroundColor(.secondary)
+                        .font(.caption)
+                    TextField("https://disk.yandex.ru/i/...", text: $urls[i])
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled(true)
+                        .keyboardType(.URL)
+                }
+            }
+            .onDelete { idx in
+                urls.remove(atOffsets: idx)
+                if urls.isEmpty { urls = [""] }
+            }
+            Button {
+                urls.append("")
+            } label: {
+                Label("Добавить документ", systemImage: "plus.circle")
+            }
+        } header: {
+            Text("Yandex Docs — документы")
+        } footer: {
+            Text("Несколько документов работают параллельно — быстрее и стабильнее. На выходном узле должен быть настроен ТОТ ЖЕ набор документов в том же порядке.")
+        }
+    }
+
+    private func save() {
+        let finalName = name.trimmingCharacters(in: .whitespaces)
+        let cleanURLs = urls
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        onSave(Profile(
+            id: id,
+            name: finalName.isEmpty ? "Профиль" : finalName,
+            transport: transport,
+            urls: cleanURLs,
+            maxToken: maxToken.trimmingCharacters(in: .whitespaces),
+            maxUid: maxUid.trimmingCharacters(in: .whitespaces)))
+        dismiss()
     }
 }
