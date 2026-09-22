@@ -33,6 +33,10 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
     /// Serial queue guarding the health monitor timer.
     private let monitorQueue = DispatchQueue(label: "com.openflux.tunnel.monitor")
+    /// Separate queue for the diagnostic log so it is never blocked by the
+    /// connection-wait loop (which sleeps on monitorQueue for up to 25s) — that
+    /// is why the app previously saw only "polling" lines and no extension log.
+    private let logQueue = DispatchQueue(label: "com.openflux.tunnel.log")
     private var healthTimer: DispatchSourceTimer?
     /// Wall-clock instant the transport was last seen connected. Used to decide
     /// when a disconnect has lasted long enough to tear the tunnel down.
@@ -53,7 +57,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
     private func diag(_ s: String) {
         let ts = Self.ts()
-        monitorQueue.async {
+        logQueue.async {
             self.diagLines.append("\(ts) [EXT] \(s)")
             if self.diagLines.count > 400 {
                 self.diagLines.removeFirst(self.diagLines.count - 400)
@@ -230,7 +234,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     /// separate process, so the log is invisible to the app otherwise). Also
     /// drains the Go-side log ring when verbose logging is on.
     override func handleAppMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)?) {
-        monitorQueue.async {
+        logQueue.async {
             var out = self.diagLines
             self.diagLines.removeAll(keepingCapacity: true)
             // Append any Go-side lines (transport reconnects etc.) if present.

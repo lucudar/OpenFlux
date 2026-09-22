@@ -126,8 +126,17 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 		existingSession := t.session
 		t.Mu.Unlock()
 
+		// After a couple of failed attempts — typically a close-1005 "ghost
+		// participant" storm where the doc server keeps rejecting a userID it
+		// still considers present — rotate to a brand-new identity to escape it.
+		// A fresh process always connects cleanly precisely because it picks a
+		// new random base; do the same mid-run instead of needing a restart.
+		if attempt >= 2 {
+			t.baseUserID = randUserID()
+		}
+
 		var userID string
-		if existingSession != nil {
+		if existingSession != nil && attempt < 2 {
 			userID = existingSession.UserID
 		} else {
 			suffix := fmt.Sprintf("%03d", t.userCounter.Add(1)%1000)
@@ -389,8 +398,10 @@ func reconnectBackoff(n int) time.Duration {
 		shift = 4
 	}
 	d := 1500 * time.Millisecond * time.Duration(1<<uint(shift))
-	if d > 30*time.Second {
-		d = 30 * time.Second
+	// Cap low so a storm means short repeated outages (and a fast userID
+	// rotation, see connectToDoc) instead of 30s dead windows.
+	if d > 8*time.Second {
+		d = 8 * time.Second
 	}
 	// add up to +50% jitter
 	d += time.Duration(rand.Int63n(int64(d/2) + 1))
