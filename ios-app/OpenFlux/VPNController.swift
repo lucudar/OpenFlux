@@ -39,6 +39,17 @@ final class VPNController: ObservableObject {
             m.protocolConfiguration = proto
             m.localizedDescription = "OpenFlux"
             m.isEnabled = true
+
+            // On-demand: reconnect automatically whenever there is a network,
+            // including after the extension tears itself down on a dead
+            // transport (see PacketTunnelProvider health monitor). Without this,
+            // a dropped tunnel stays dropped until the user reconnects by hand —
+            // the main cause of "туннель отваливается".
+            let connectRule = NEOnDemandRuleConnect()
+            connectRule.interfaceTypeMatch = .any
+            m.onDemandRules = [connectRule]
+            m.isOnDemandEnabled = true
+
             do {
                 try await m.saveToPreferences()
                 try await m.loadFromPreferences()   // required before starting
@@ -51,7 +62,19 @@ final class VPNController: ObservableObject {
     }
 
     func stop() {
-        manager?.connection.stopVPNTunnel()
+        // Disable on-demand first, otherwise the system immediately reconnects
+        // the tunnel and the user can't actually turn it off.
+        Task {
+            guard let m = manager else { return }
+            m.isOnDemandEnabled = false
+            do {
+                try await m.saveToPreferences()
+                try await m.loadFromPreferences()
+            } catch {
+                self.status = "Error: \(error.localizedDescription)"
+            }
+            m.connection.stopVPNTunnel()
+        }
     }
 
     @objc private func statusChanged() { refreshStatus() }

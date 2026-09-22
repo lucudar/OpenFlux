@@ -216,6 +216,27 @@ func OpenFluxTunReadPacket(buf *C.char, max C.int) C.int {
 	}
 }
 
+// OpenFluxPacketTunnelConnected reports whether the packet-tunnel transport
+// currently has a live connection. Returns 1 when running and the underlying
+// transport reports connected, 0 otherwise (stopped, or mid-reconnect).
+//
+// The NEPacketTunnelProvider extension uses this to (a) confirm a real
+// connection before reporting startTunnel success, and (b) detect a dead
+// transport so it can tear the tunnel down and let on-demand relaunch it,
+// instead of sitting in a "connected but no traffic" zombie state.
+//
+//export OpenFluxPacketTunnelConnected
+func OpenFluxPacketTunnelConnected() C.int {
+	ptMu.Lock()
+	on := ptOn
+	t := ptTrans
+	ptMu.Unlock()
+	if on && t != nil && t.IsConnected() {
+		return C.int(1)
+	}
+	return C.int(0)
+}
+
 //export OpenFluxStopPacketTunnel
 func OpenFluxStopPacketTunnel() {
 	ptMu.Lock()

@@ -30,6 +30,18 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     }()
 
 
+    /// Serial queue guarding the health monitor timer.
+    private let monitorQueue = DispatchQueue(label: "com.openflux.tunnel.monitor")
+    private var healthTimer: DispatchSourceTimer?
+    /// Wall-clock instant the transport was last seen connected. Used to decide
+    /// when a disconnect has lasted long enough to tear the tunnel down.
+    private var lastConnected = Date()
+    /// How long the transport may stay disconnected before we give up on the
+    /// in-process reconnect and hand control back to the system (on-demand then
+    /// relaunches the extension fresh). The Go transport reconnects with backoff
+    /// on its own; this is the outer safety net for a wedged session.
+    private let deadTransportGrace: TimeInterval = 45
+
     override func startTunnel(options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void) {
         let conf = (protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration ?? [:]
         let transport = (conf["transport"] as? String) ?? "yandex"
@@ -79,13 +91,82 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                     userInfo: [NSLocalizedDescriptionKey: "start failed (\(rc))"]))
                 return
             }
+            // Pump packets immediately: the transport reconnects in the
+            // background, so packets can start flowing the moment it is up.
             self.startReadLoop()
             self.startWriteLoop()
-            completionHandler(nil)
+
+            // Don't report success until the transport has actually connected.
+            // OpenFluxStartPacketTunnel returns as soon as the connect goroutine
+            // is spawned, so reporting success here (as before) made iOS show
+            // "Connected" with no working link. Poll for a real connection with
+            // a bounded timeout instead.
+            self.waitForConnection(timeout: 25) { connected in
+                if connected {
+                    self.lastConnected = Date()
+                    self.startHealthMonitor()
+                    completionHandler(nil)
+                } else {
+                    // Never came up within the window. Tear down and report the
+                    // failure so the UI shows a real error and on-demand can
+                    // retry from a clean slate instead of a half-open tunnel.
+                    OpenFluxStopPacketTunnel()
+                    completionHandler(NSError(domain: "OpenFlux", code: -1001,
+                        userInfo: [NSLocalizedDescriptionKey: "transport did not connect in time"]))
+                }
+            }
         }
     }
 
+    /// Polls the Go transport's connection status until it reports connected or
+    /// the timeout elapses. Runs off the main path; `done` is called once.
+    private func waitForConnection(timeout: TimeInterval, done: @escaping (Bool) -> Void) {
+        let deadline = Date().addingTimeInterval(timeout)
+        monitorQueue.async {
+            while Date() < deadline {
+                if OpenFluxPacketTunnelConnected() != 0 {
+                    done(true)
+                    return
+                }
+                Thread.sleep(forTimeInterval: 0.25)
+            }
+            done(OpenFluxPacketTunnelConnected() != 0)
+        }
+    }
+
+    /// Watches the transport after a successful start. If it stays disconnected
+    /// past `deadTransportGrace`, cancels the tunnel so the system (on-demand)
+    /// relaunches the extension fresh — the fix for the "connected but no
+    /// traffic" zombie state.
+    private func startHealthMonitor() {
+        let timer = DispatchSource.makeTimerSource(queue: monitorQueue)
+        timer.schedule(deadline: .now() + 5, repeating: 5)
+        timer.setEventHandler { [weak self] in
+            guard let self = self else { return }
+            if OpenFluxPacketTunnelConnected() != 0 {
+                self.lastConnected = Date()
+                return
+            }
+            if Date().timeIntervalSince(self.lastConnected) > self.deadTransportGrace {
+                self.stopHealthMonitor()
+                OpenFluxStopPacketTunnel()
+                // A non-nil error makes the system re-evaluate on-demand rules
+                // and relaunch the tunnel, rather than leaving it stopped.
+                self.cancelTunnelWithError(NSError(domain: "OpenFlux", code: -1002,
+                    userInfo: [NSLocalizedDescriptionKey: "transport lost; relaunching"]))
+            }
+        }
+        healthTimer = timer
+        timer.resume()
+    }
+
+    private func stopHealthMonitor() {
+        healthTimer?.cancel()
+        healthTimer = nil
+    }
+
     override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
+        stopHealthMonitor()
         OpenFluxStopPacketTunnel()
         completionHandler()
     }

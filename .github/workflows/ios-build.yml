@@ -1,0 +1,87 @@
+name: iOS build (unsigned IPA)
+
+# Builds the OpenFlux Go static library, generates the Xcode project with
+# XcodeGen, archives WITHOUT code signing, and packages an unsigned .ipa.
+#
+# You then re-sign and install it yourself with your own certificate using
+# Sideloadly / AltStore / ESign (which rewrite the bundle ids of the app AND
+# its packet-tunnel extension and apply your provisioning profile). No signing
+# secrets are stored in GitHub — your .p12 never leaves your machine.
+#
+# Run it from the Actions tab (Run workflow) or by pushing a v* tag.
+# Download the "OpenFlux-unsigned-ipa" artifact from the finished run.
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -switch /Applications/Xcode_26.app 2>/dev/null || sudo xcode-select -switch /Applications/Xcode.app
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Build Go static library (arm64 iOS)
+        run: ./build_ios.sh
+
+      - name: Sync library into the app
+        run: |
+          mkdir -p ios-app/Lib
+          cp output/ios/liboflux.a ios-app/Lib/liboflux.a
+          cp output/ios/liboflux.h ios-app/Lib/liboflux.h
+
+      - name: Generate Xcode project
+        working-directory: ios-app
+        run: xcodegen generate
+
+      - name: Archive (unsigned)
+        working-directory: ios-app
+        run: |
+          xcodebuild -project OpenFlux.xcodeproj -scheme OpenFlux \
+            -configuration Release -destination 'generic/platform=iOS' \
+            -archivePath build/OpenFlux.xcarchive \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            clean archive
+
+      - name: Package unsigned IPA
+        working-directory: ios-app
+        run: |
+          APP_PATH="build/OpenFlux.xcarchive/Products/Applications/OpenFlux.app"
+          if [ ! -d "$APP_PATH" ]; then
+            echo "::error::OpenFlux.app not found in archive"
+            ls -R build/OpenFlux.xcarchive/Products || true
+            exit 1
+          fi
+          rm -rf build/Payload build/OpenFlux-unsigned.ipa
+          mkdir -p build/Payload
+          cp -R "$APP_PATH" build/Payload/
+          # Sanity check: the packet-tunnel extension must be embedded.
+          if [ ! -d "build/Payload/OpenFlux.app/PlugIns/OpenFluxTunnel.appex" ]; then
+            echo "::warning::tunnel extension (OpenFluxTunnel.appex) not found under PlugIns — the VPN will not work"
+            ls -R build/Payload/OpenFlux.app/PlugIns 2>/dev/null || true
+          fi
+          (cd build && zip -qry OpenFlux-unsigned.ipa Payload)
+          echo "Built:"; ls -lh build/OpenFlux-unsigned.ipa
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenFlux-unsigned-ipa
+          path: ios-app/build/OpenFlux-unsigned.ipa
+          if-no-files-found: error
