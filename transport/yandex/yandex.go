@@ -63,6 +63,13 @@ type YandexDocsTransport struct {
 
 	userCounter atomic.Int32
 	baseUserID  string
+
+	// End-to-end heartbeat liveness. lastHBEcho is when our "---KA?---" probe
+	// last came back as "---KA!---"; sawHBEcho becomes true once the current
+	// connection has echoed at least one probe (so we never enforce a stall
+	// against a peer that doesn't support the echo). See keepAliveLoop.
+	lastHBEcho atomic.Int64
+	sawHBEcho  atomic.Bool
 }
 
 func NewYandexDocsTransport(url string, config transport.TransportConfig) *YandexDocsTransport {
@@ -196,6 +203,11 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 		t.SetConnected(true)
 		t.Mu.Unlock()
 
+		// Fresh heartbeat state for this connection: start the stall clock now,
+		// and require this connection to prove it echoes before enforcing a stall.
+		t.lastHBEcho.Store(time.Now().UnixNano())
+		t.sawHBEcho.Store(false)
+
 		if existingSession == nil {
 			utils.SafeGo("yandex.writer", t.writerLoop)
 		}
@@ -294,20 +306,41 @@ func (t *YandexDocsTransport) writerLoop() {
 }
 
 func (t *YandexDocsTransport) keepAliveLoop() {
-	ticker := time.NewTicker(t.GetConfig().KeepAliveInterval)
+	interval := t.GetConfig().KeepAliveInterval
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	keepAliveMsg := `42["message",{"type":"cursor","cursor":"18;---KA---"}]`
+	// Echoed end-to-end heartbeat. A local WS write only proves our own socket
+	// is open; it can't see the doc-relay silently stopping message routing
+	// between co-editors after idle (the WS stays "connected" while nothing
+	// actually round-trips — the "works only when I poke it" stall). We send a
+	// "---KA?---" probe the peer bounces back as "---KA!---": requiring the echo
+	// both keeps the path warm (so the relay doesn't idle us out) and detects a
+	// silent stall so we can reconnect instead of waiting for the user's next
+	// request to time out.
+	const probe = `42["message",{"type":"cursor","cursor":"18;---KA?---"}]`
+	staleAfter := 3 * interval
 
 	for t.IsRunning() {
 		<-ticker.C
 		t.Mu.Lock()
 		session := t.session
 		t.Mu.Unlock()
-
-		if session != nil && session.Conn != nil {
-			if err := session.safeWrite(websocket.TextMessage, []byte(keepAliveMsg)); err != nil {
-				utils.Debugf("[YDOCS] Keep-alive failed: %v", err)
+		if session == nil || session.Conn == nil {
+			continue
+		}
+		if err := session.safeWrite(websocket.TextMessage, []byte(probe)); err != nil {
+			utils.Debugf("[YDOCS] Keep-alive failed: %v", err)
+			t.SetConnected(false)
+			continue
+		}
+		// Only enforce a stall once this connection has proven it echoes, so a
+		// peer that doesn't support the heartbeat never triggers false reconnects.
+		if t.sawHBEcho.Load() {
+			last := t.lastHBEcho.Load()
+			if last != 0 && time.Since(time.Unix(0, last)) > staleAfter {
+				utils.Debugf("[YDOCS] heartbeat stalled >%v (WS still open); forcing reconnect", staleAfter)
 				t.SetConnected(false)
+				session.Conn.Close() // unblock the read loop so it reconnects
 			}
 		}
 	}
@@ -316,6 +349,23 @@ func (t *YandexDocsTransport) keepAliveLoop() {
 func (t *YandexDocsTransport) handleMessage(session *DocSession, data []byte) {
 	text := string(data)
 
+	// End-to-end heartbeat: bounce a peer's probe back, and record our own
+	// probe returning. Checked before the plain "---KA---" (old-peer keepalive)
+	// so the markers don't collide.
+	if strings.Contains(text, "---KA?---") {
+		if session != nil && session.Conn != nil {
+			const echo = `42["message",{"type":"cursor","cursor":"18;---KA!---"}]`
+			session.safeWrite(websocket.TextMessage, []byte(echo))
+		}
+		return
+	}
+	if strings.Contains(text, "---KA!---") {
+		t.lastHBEcho.Store(time.Now().UnixNano())
+		if t.sawHBEcho.CompareAndSwap(false, true) {
+			utils.Debugf("[YDOCS] heartbeat echo confirmed (end-to-end alive)")
+		}
+		return
+	}
 	if strings.Contains(text, "---KA---") {
 		return
 	}
