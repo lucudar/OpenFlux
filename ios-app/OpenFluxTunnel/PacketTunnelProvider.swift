@@ -1,4 +1,5 @@
 import NetworkExtension
+import os
 
 /// System VPN entry point. Bridges the device's IP packets to the OpenFlux Go
 /// tun2socks stack (TCP forwarded through the transport; DNS proxied over TCP).
@@ -42,6 +43,37 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     /// on its own; this is the outer safety net for a wedged session.
     private let deadTransportGrace: TimeInterval = 45
 
+    // ---- diagnostic log, pulled by the app over handleAppMessage ----
+    // The extension is a separate process, so its logs aren't visible in the
+    // app UI. We keep a small always-on ring of lifecycle/health/memory events
+    // that the app polls and displays, to diagnose reconnects and memory kills.
+    private var diagLines: [String] = []
+    private var lastConnState = false
+    private var healthTick = 0
+
+    private func diag(_ s: String) {
+        let ts = Self.ts()
+        monitorQueue.async {
+            self.diagLines.append("\(ts) [EXT] \(s)")
+            if self.diagLines.count > 400 {
+                self.diagLines.removeFirst(self.diagLines.count - 400)
+            }
+        }
+    }
+
+    private static func ts() -> String {
+        let d = Date()
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss"
+        return f.string(from: d)
+    }
+
+    /// Bytes the extension may still allocate before iOS kills it. Near-zero
+    /// right before a restart is the signature of a memory kill.
+    private func availMemMB() -> Int {
+        return Int(os_proc_available_memory() / (1024 * 1024))
+    }
+
     override func startTunnel(options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void) {
         let conf = (protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration ?? [:]
         let transport = (conf["transport"] as? String) ?? "yandex"
@@ -51,6 +83,12 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         // Forward non-DNS UDP (QUIC) over the transport. Off by default; only
         // enable against a UDP-capable exit node.
         let tunnelUDP = ((conf["tunnelUDP"] as? NSNumber)?.boolValue) ?? false
+
+        // Turn on Go-side verbose logging in THIS (extension) process so the
+        // app can pull transport reconnect events via handleAppMessage. The
+        // yandex client path logs only connect/reconnect, not per-packet.
+        OpenFluxSetDebug(1)
+        diag("startTunnel transport=\(transport) udp=\(tunnelUDP) availMem=\(availMemMB())MB")
 
         // Virtual interface: capture all IPv4 + all DNS.
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
@@ -108,12 +146,15 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             self.waitForConnection(timeout: 25) { connected in
                 if connected {
                     self.lastConnected = Date()
+                    self.lastConnState = true
+                    self.diag("transport connected; tunnel up")
                     self.startHealthMonitor()
                     completionHandler(nil)
                 } else {
                     // Never came up within the window. Tear down and report the
                     // failure so the UI shows a real error and on-demand can
                     // retry from a clean slate instead of a half-open tunnel.
+                    self.diag("transport did NOT connect within 25s; failing start")
                     OpenFluxStopPacketTunnel()
                     completionHandler(NSError(domain: "OpenFlux", code: -1001,
                         userInfo: [NSLocalizedDescriptionKey: "transport did not connect in time"]))
@@ -147,11 +188,20 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         timer.schedule(deadline: .now() + 5, repeating: 5)
         timer.setEventHandler { [weak self] in
             guard let self = self else { return }
-            if OpenFluxPacketTunnelConnected() != 0 {
+            let connected = OpenFluxPacketTunnelConnected() != 0
+            // Log every ~15s (every 3rd tick) plus on any state change, so the
+            // memory trend is visible without flooding.
+            self.healthTick += 1
+            if connected != self.lastConnState || self.healthTick % 3 == 0 {
+                self.diag("health connected=\(connected) availMem=\(self.availMemMB())MB")
+            }
+            self.lastConnState = connected
+            if connected {
                 self.lastConnected = Date()
                 return
             }
             if Date().timeIntervalSince(self.lastConnected) > self.deadTransportGrace {
+                self.diag("transport lost >\(Int(self.deadTransportGrace))s; tearing down for relaunch")
                 self.stopHealthMonitor()
                 OpenFluxStopPacketTunnel()
                 // A non-nil error makes the system re-evaluate on-demand rules
@@ -170,9 +220,30 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
+        diag("stopTunnel reason=\(reason.rawValue) availMem=\(availMemMB())MB")
         stopHealthMonitor()
         OpenFluxStopPacketTunnel()
         completionHandler()
+    }
+
+    /// The app polls this to pull the extension's diagnostic log (it runs in a
+    /// separate process, so the log is invisible to the app otherwise). Also
+    /// drains the Go-side log ring when verbose logging is on.
+    override func handleAppMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)?) {
+        monitorQueue.async {
+            var out = self.diagLines
+            self.diagLines.removeAll(keepingCapacity: true)
+            // Append any Go-side lines (transport reconnects etc.) if present.
+            if let c = OpenFluxReadLog() {
+                let s = String(cString: c)
+                OpenFluxFreeString(c)
+                if !s.isEmpty {
+                    for line in s.split(separator: "\n") { out.append(String(line)) }
+                }
+            }
+            let joined = out.joined(separator: "\n")
+            completionHandler?(joined.isEmpty ? Data() : Data(joined.utf8))
+        }
     }
 
     /// Device -> Go stack.

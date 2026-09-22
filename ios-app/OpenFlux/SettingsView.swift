@@ -3,6 +3,7 @@ import SwiftUI
 struct SettingsView: View {
     @ObservedObject var store: ProfileStore
     @ObservedObject var tunnel: TunnelController
+    @ObservedObject var vpn: VPNController
 
     @AppStorage("socksPort") private var socksPort: String = "10808"
     @AppStorage("debugLog") private var debugLog: Bool = false
@@ -17,6 +18,7 @@ struct SettingsView: View {
             Form {
                 routingSection
                 profilesSection
+                vpnLogSection
                 proxySection
                 logSection
             }
@@ -83,6 +85,28 @@ struct SettingsView: View {
             } label: {
                 Label("Добавить профиль", systemImage: "plus.circle")
             }
+        }
+    }
+
+    private var vpnLogSection: some View {
+        Section {
+            ScrollViewReader { proxy in
+                ScrollView {
+                    Text(vpn.vpnLog.isEmpty ? "— (лог появляется, пока VPN подключён)" : vpn.vpnLog)
+                        .font(.system(.caption2, design: .monospaced))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                        .id("vpntail")
+                }
+                .frame(height: 220)
+                .onChange(of: vpn.vpnLog) { _ in
+                    withAnimation { proxy.scrollTo("vpntail", anchor: .bottom) }
+                }
+            }
+        } header: {
+            Text("VPN журнал (расширение)")
+        } footer: {
+            Text("Статус подключения, переподключения и свободная память расширения. Память близко к 0 перед перезапуском = убито по памяти.")
         }
     }
 

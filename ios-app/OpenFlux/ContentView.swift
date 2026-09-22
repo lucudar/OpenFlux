@@ -61,7 +61,7 @@ struct ContentView: View {
                 }
             }
             .sheet(isPresented: $showSettings) {
-                SettingsView(store: store, tunnel: tunnel)
+                SettingsView(store: store, tunnel: tunnel, vpn: vpn)
             }
             .sheet(isPresented: $showInfo) { InfoView() }
         }

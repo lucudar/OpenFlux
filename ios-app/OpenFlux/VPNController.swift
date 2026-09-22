@@ -9,9 +9,12 @@ import Combine
 final class VPNController: ObservableObject {
     @Published var status: String = "Disconnected"
     @Published var active = false
+    /// Diagnostic log pulled from the packet-tunnel extension (separate process).
+    @Published var vpnLog: String = ""
 
     private var manager: NETunnelProviderManager?
     private let extensionBundleId = "com.p1neapplexpress-saharev.openflux.tunnel"
+    private var logTimer: Timer?
 
     init() {
         NotificationCenter.default.addObserver(
@@ -89,6 +92,45 @@ final class VPNController: ObservableObject {
         case .disconnecting: status = "Disconnecting…"; active = true
         case .reasserting:   status = "Reasserting…";  active = true
         default:             status = "Disconnected";  active = false
+        }
+        // Poll the extension for its diagnostic log while there is a session.
+        if conn.status == .disconnected || conn.status == .invalid {
+            stopLogPolling()
+        } else {
+            startLogPolling()
+        }
+    }
+
+    private func startLogPolling() {
+        guard logTimer == nil else { return }
+        appendVPNLog("[app] --- polling extension log ---")
+        logTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.pullExtensionLog() }
+        }
+    }
+
+    private func stopLogPolling() {
+        logTimer?.invalidate()
+        logTimer = nil
+    }
+
+    private func pullExtensionLog() {
+        guard let session = manager?.connection as? NETunnelProviderSession else { return }
+        do {
+            try session.sendProviderMessage(Data("log".utf8)) { [weak self] resp in
+                guard let resp = resp, !resp.isEmpty,
+                      let s = String(data: resp, encoding: .utf8), !s.isEmpty else { return }
+                Task { @MainActor in self?.appendVPNLog(s) }
+            }
+        } catch {
+            // Extension may not be up yet; ignore and retry on the next tick.
+        }
+    }
+
+    private func appendVPNLog(_ s: String) {
+        vpnLog += (vpnLog.isEmpty ? "" : "\n") + s
+        if vpnLog.count > 20000 {
+            vpnLog = String(vpnLog.suffix(20000))
         }
     }
 }
