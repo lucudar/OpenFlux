@@ -90,7 +90,13 @@ func OpenFluxStartPacketTunnel(transportType, url, maxToken, maxUid *C.char, tun
 		for i, u := range urls {
 			subs[i] = yandex.NewYandexDocsTransport(u, config)
 		}
-		t = transport.NewCompressedTransport(transport.NewMultiTransport(subs))
+		// Batched (zstd + coalescing) instead of the old per-packet legacy codec:
+		// ~16x fewer WebSocket messages per MB, which the doc server throttles far
+		// less under load (measured: legacy stalled a fresh transfer where batched
+		// completed). Must match the exit's --codec=batched. zstd's footprint is
+		// larger than LZ4 but batches are small (8 KB) and the decoder is memory-
+		// capped, so it stays within the 32 MB extension budget set above.
+		t = transport.NewBatchedTransport(transport.NewMultiTransport(subs))
 	case "oneme":
 		uidint, _ := strconv.ParseInt(mUid, 10, 64)
 		t = transport.NewCompressedTransport(oneme.NewOneMeTransport(false, mToken, uidint, config))

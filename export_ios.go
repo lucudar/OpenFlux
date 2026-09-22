@@ -174,7 +174,11 @@ func OpenFluxStartClient(transportType, url, socksAddr, maxToken, maxUid *C.char
 		for i, u := range urls {
 			subs[i] = yandex.NewYandexDocsTransport(u, config)
 		}
-		t = transport.NewCompressedTransport(transport.NewMultiTransport(subs))
+		// Batched (zstd + coalescing): sends ~16x fewer WebSocket messages per
+		// MB than the old per-packet legacy codec, which the doc server throttles
+		// under load. Must match the exit's --codec=batched. Wrapping order
+		// mirrors main.go: codec is outermost, over the multi-document layer.
+		t = transport.NewBatchedTransport(transport.NewMultiTransport(subs))
 	case "oneme":
 		uidint, _ := strconv.ParseInt(mUid, 10, 64)
 		t = transport.NewCompressedTransport(oneme.NewOneMeTransport(false, mToken, uidint, config))
