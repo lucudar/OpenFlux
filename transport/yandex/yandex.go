@@ -220,12 +220,20 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 				utils.Debugf("[YDOCS] Read error: %v", err)
 				t.SetConnected(false)
 				conn.Close()
-				// If the session was healthy for a while, treat the next
-				// connect as fresh (attempt -1 -> next attempt 0) so backoff
-				// doesn't keep growing across normal long-lived reconnects.
-				next := attempt
-				if time.Since(connectedAt) > 15*time.Second {
-					next = -1
+				// The dial itself succeeded (we got here), so the network path to
+				// Yandex is fine — the read error is the doc-relay closing us.
+				// Escalating backoff on that only turns each close into a longer
+				// dead window (climbing to the ~11s cap during a ghost-participant
+				// storm, where the relay boots a new participant ~70ms after
+				// connect). So don't escalate on a post-dial close:
+				//   - long-lived session (>15s): normal fresh reconnect at floor;
+				//   - short-lived (boot storm): rotate to a fresh participant
+				//     identity to dodge the per-identity boot, and still retry at
+				//     the floor so the outage the user sees stays ~2s, not ~11s.
+				next := -1
+				if time.Since(connectedAt) <= 15*time.Second {
+					t.baseUserID = randUserID()
+					next = 0
 				}
 				t.scheduleReconnect(next)
 				return
