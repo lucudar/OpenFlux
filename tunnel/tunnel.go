@@ -149,8 +149,9 @@ func (t *TCPTunnel) setupExitNodeProxy(tunnelNIC tcpip.NICID) {
 }
 
 // handleExitUDP bridges one in-tunnel UDP flow to a real UDP socket on the
-// exit host, relaying datagrams both ways until an idle timeout.
-func (t *TCPTunnel) handleExitUDP(r *udp.ForwarderRequest) {
+// exit host, relaying datagrams both ways until an idle timeout. Returns true
+// to signal the packet was handled (the udp.ForwarderHandler contract).
+func (t *TCPTunnel) handleExitUDP(r *udp.ForwarderRequest) bool {
 	id := r.ID()
 	dest := fmt.Sprintf("%s:%d", id.LocalAddress.String(), id.LocalPort)
 
@@ -158,7 +159,7 @@ func (t *TCPTunnel) handleExitUDP(r *udp.ForwarderRequest) {
 	ep, tErr := r.CreateEndpoint(&wq)
 	if tErr != nil {
 		utils.Debugf("[EXIT-UDP] CreateEndpoint %s: %v", dest, tErr)
-		return
+		return true
 	}
 	local := gonet.NewUDPConn(&wq, ep)
 
@@ -213,6 +214,7 @@ func (t *TCPTunnel) handleExitUDP(r *udp.ForwarderRequest) {
 		remote.Close()
 		utils.Debugf("[EXIT-UDP] %s closed", dest)
 	})
+	return true
 }
 
 func (t *TCPTunnel) handleExitTCP(r *tcp.ForwarderRequest) {
