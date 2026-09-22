@@ -106,6 +106,28 @@ final class TunnelController: ObservableObject {
         }
     }
 
+    /// Connectivity check for the system VPN path: a plain request that, when
+    /// the VPN is up, is carried through the tunnel. Result goes to the log.
+    func testConnectivity() {
+        appendLog("[app] проверка доступности…")
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 20
+        config.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        let session = URLSession(configuration: config)
+        let url = URL(string: "http://ifconfig.me/ip")!
+        session.dataTask(with: url) { [weak self] data, _, err in
+            Task { @MainActor in
+                if let err = err {
+                    self?.appendLog("[app] тест не прошёл: \(err.localizedDescription)")
+                } else if let data = data, let body = String(data: data, encoding: .utf8) {
+                    self?.appendLog("[app] OK, внешний IP: \(body.trimmingCharacters(in: .whitespacesAndNewlines))")
+                } else {
+                    self?.appendLog("[app] тест: пустой ответ")
+                }
+            }
+        }.resume()
+    }
+
     /// Connectivity check routed through the local SOCKS5 proxy.
     func testThroughProxy() {
         guard !socksAddr.isEmpty else { return }
