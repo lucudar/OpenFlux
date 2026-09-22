@@ -21,6 +21,7 @@ struct SettingsView: View {
                 vpnLogSection
                 proxySection
                 logSection
+                aboutSection
             }
             .navigationTitle("Настройки")
             .navigationBarTitleDisplayMode(.inline)
@@ -38,6 +39,22 @@ struct SettingsView: View {
                         store.add(saved)
                     }
                 }
+            }
+        }
+    }
+
+    private static var appVersion: String {
+        let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+        let b = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
+        return "\(v) (\(b))"
+    }
+
+    private var aboutSection: some View {
+        Section {
+            HStack {
+                Text("Версия")
+                Spacer()
+                Text(Self.appVersion).foregroundColor(.secondary)
             }
         }
     }

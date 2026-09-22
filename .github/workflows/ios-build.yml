@@ -51,7 +51,15 @@ jobs:
 
       - name: Generate Xcode project
         working-directory: ios-app
-        run: xcodegen generate
+        run: |
+          # Bump the version every build so a reinstall over the previous IPA
+          # actually replaces the app AND its extension. With a fixed version,
+          # iOS/sideload tools may keep the old code (why new fixes "don't apply").
+          B="${{ github.run_number }}"
+          sed -i '' -E "s/CURRENT_PROJECT_VERSION: \"[0-9]+\"/CURRENT_PROJECT_VERSION: \"$B\"/" project.yml
+          sed -i '' -E "s/MARKETING_VERSION: \"[0-9.]+\"/MARKETING_VERSION: \"1.0.$B\"/" project.yml
+          grep -E "CURRENT_PROJECT_VERSION|MARKETING_VERSION" project.yml
+          xcodegen generate
 
       - name: Archive (unsigned)
         working-directory: ios-app
