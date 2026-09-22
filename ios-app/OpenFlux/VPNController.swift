@@ -26,7 +26,8 @@ final class VPNController: ObservableObject {
         refreshStatus()
     }
 
-    func start(transport: String, url: String, maxToken: String, maxUid: String) {
+    func start(transport: String, url: String, maxToken: String, maxUid: String,
+               tunnelUDP: Bool = false) {
         Task {
             let m = manager ?? NETunnelProviderManager()
             let proto = NETunnelProviderProtocol()
@@ -35,6 +36,7 @@ final class VPNController: ObservableObject {
             proto.providerConfiguration = [
                 "transport": transport, "url": url,
                 "maxToken": maxToken, "maxUid": maxUid,
+                "tunnelUDP": NSNumber(value: tunnelUDP),
             ]
             m.protocolConfiguration = proto
             m.localizedDescription = "OpenFlux"

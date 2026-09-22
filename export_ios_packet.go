@@ -40,16 +40,17 @@ import (
 const tunClientIP = "10.10.10.2"
 
 var (
-	ptMu     sync.Mutex
-	ptOn     bool
-	ptTrans  transport.Transport
-	ptOutQ   chan []byte
-	ptCtx    context.Context
-	ptCancel context.CancelFunc
+	ptMu        sync.Mutex
+	ptOn        bool
+	ptTrans     transport.Transport
+	ptOutQ      chan []byte
+	ptCtx       context.Context
+	ptCancel    context.CancelFunc
+	ptTunnelUDP bool // forward non-DNS UDP (QUIC) over the transport (needs a UDP-capable exit)
 )
 
 //export OpenFluxStartPacketTunnel
-func OpenFluxStartPacketTunnel(transportType, url, maxToken, maxUid *C.char) (rc C.int) {
+func OpenFluxStartPacketTunnel(transportType, url, maxToken, maxUid *C.char, tunnelUDP C.int) (rc C.int) {
 	tt := C.GoString(transportType)
 	docURL := C.GoString(url)
 	mToken := C.GoString(maxToken)
@@ -68,9 +69,14 @@ func OpenFluxStartPacketTunnel(transportType, url, maxToken, maxUid *C.char) (rc
 		return C.int(startAlreadyRunning)
 	}
 
-	// Keep the extension well under the NE memory cap.
-	debug.SetMemoryLimit(40 << 20)
-	debug.SetGCPercent(20)
+	// Keep the extension well under iOS's ~50 MB NE memory cap. Under heavy
+	// load (many flows + transport buffers) the extension was being killed by
+	// the OS and relaunched ("restarts under load"), so target a tighter heap
+	// and GC harder — trading a little CPU for staying alive.
+	debug.SetMemoryLimit(32 << 20)
+	debug.SetGCPercent(10)
+
+	ptTunnelUDP = tunnelUDP != 0
 
 	config := transport.DefaultConfig()
 	var t transport.Transport
@@ -118,6 +124,7 @@ func OpenFluxTunWritePacket(buf *C.char, length C.int) {
 	ptMu.Lock()
 	t := ptTrans
 	outQ := ptOutQ
+	udpOn := ptTunnelUDP
 	ptMu.Unlock()
 	if t == nil {
 		return
@@ -136,18 +143,26 @@ func OpenFluxTunWritePacket(buf *C.char, length C.int) {
 		}
 		dstPort := binary.BigEndian.Uint16(pkt[ihl+2 : ihl+4])
 		if dstPort == 53 {
-			// Bound concurrent DNS resolutions so a burst can't spawn an
-			// unbounded pile of goroutines + TLS handshakes (memory).
+			// DNS is always answered locally over DNS-over-TLS (fast, reliable),
+			// regardless of the UDP-tunnel setting. Bound concurrent resolutions
+			// so a burst can't spawn an unbounded pile of goroutines + TLS
+			// handshakes (memory).
 			select {
 			case dnsSem <- struct{}{}:
 				go func() { defer func() { <-dnsSem }(); handleDNSPacket(pkt, outQ) }()
 			default: // too many in flight: drop, the client retries
 			}
+			return
+		}
+		if udpOn {
+			// Tunnel UDP (e.g. QUIC/UDP:443) as a raw IP packet over the
+			// transport. Requires a UDP-capable exit node; the return packets
+			// come back through the normal receive path like any IP packet.
+			t.Send(pkt)
 		} else {
-			// We can't carry UDP (TCP-only transport). Instead of silently
-			// dropping it (which makes apps stall on QUIC/UDP:443 before
-			// falling back to TCP), reply ICMP port-unreachable so they switch
-			// to TCP immediately.
+			// UDP tunneling disabled: reply ICMP port-unreachable so apps that
+			// try QUIC fall back to TCP immediately instead of stalling. This
+			// keeps things working against a TCP-only exit.
 			sendICMPPortUnreachable(pkt, outQ)
 		}
 	}

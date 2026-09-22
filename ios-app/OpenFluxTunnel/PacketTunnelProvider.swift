@@ -48,6 +48,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         let url = (conf["url"] as? String) ?? ""
         let maxToken = (conf["maxToken"] as? String) ?? ""
         let maxUid = (conf["maxUid"] as? String) ?? ""
+        // Forward non-DNS UDP (QUIC) over the transport. Off by default; only
+        // enable against a UDP-capable exit node.
+        let tunnelUDP = ((conf["tunnelUDP"] as? NSNumber)?.boolValue) ?? false
 
         // Virtual interface: capture all IPv4 + all DNS.
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
@@ -81,7 +84,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                                 UnsafeMutablePointer(mutating: tt),
                                 UnsafeMutablePointer(mutating: u),
                                 UnsafeMutablePointer(mutating: tok),
-                                UnsafeMutablePointer(mutating: uid))
+                                UnsafeMutablePointer(mutating: uid),
+                                Int32(tunnelUDP ? 1 : 0))
                         }
                     }
                 }

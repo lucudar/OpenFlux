@@ -6,6 +6,7 @@ struct SettingsView: View {
 
     @AppStorage("socksPort") private var socksPort: String = "10808"
     @AppStorage("debugLog") private var debugLog: Bool = false
+    @AppStorage("tunnelUDP") private var tunnelUDP: Bool = false
 
     @Environment(\.dismiss) private var dismiss
     @State private var editing: Profile?
@@ -14,6 +15,7 @@ struct SettingsView: View {
     var body: some View {
         NavigationView {
             Form {
+                routingSection
                 profilesSection
                 proxySection
                 logSection
@@ -35,6 +37,16 @@ struct SettingsView: View {
                     }
                 }
             }
+        }
+    }
+
+    private var routingSection: some View {
+        Section {
+            Toggle("Туннелировать UDP / QUIC", isOn: $tunnelUDP)
+            Text("Выкл = QUIC падает на TCP (работает на любом узле). Вкл = требуется UDP-совместимый узел. Меняется при следующем подключении.")
+                .font(.caption).foregroundColor(.secondary)
+        } header: {
+            Text("Маршрутизация")
         }
     }
 

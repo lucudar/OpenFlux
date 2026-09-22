@@ -7,6 +7,7 @@ struct ContentView: View {
 
     @State private var showSettings = false
     @State private var showInfo = false
+    @AppStorage("tunnelUDP") private var tunnelUDP: Bool = false
 
     private var selected: Profile? { store.selected }
     private var canConnect: Bool { selected?.isComplete ?? false }
@@ -78,7 +79,8 @@ struct ContentView: View {
                 vpn.stop()
             } else if let p = selected {
                 vpn.start(transport: p.transport, url: p.url,
-                          maxToken: p.maxToken, maxUid: p.maxUid)
+                          maxToken: p.maxToken, maxUid: p.maxUid,
+                          tunnelUDP: tunnelUDP)
             }
         } label: {
             ZStack {

@@ -1,0 +1,43 @@
+name: Linux exit build
+
+# Cross-builds the stripped Linux amd64 openflux binary (client + exit node)
+# and publishes it as a Release asset, so it can be downloaded onto a VPS
+# without installing Go there.
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "linux-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build (linux/amd64, stripped)
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -ldflags="-s -w" -trimpath -o openflux-linux-amd64 .
+          ls -lh openflux-linux-amd64
+
+      - name: Publish to a Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="linux-b${{ github.run_number }}"
+          gh release create "$TAG" openflux-linux-amd64 \
+            --repo "${{ github.repository }}" \
+            --title "OpenFlux Linux exit ($TAG)" \
+            --notes "Stripped linux/amd64 binary (client + exit). Includes UDP-forwarding exit."

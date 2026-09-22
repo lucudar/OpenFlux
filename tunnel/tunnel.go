@@ -13,6 +13,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 	"gvisor.dev/gvisor/pkg/waiter"
 
 	"openflux/transport"
@@ -93,7 +94,7 @@ func NewTCPTunnelMode(trans transport.Transport, isExitNode bool, mode ExitMode)
 	utils.Debugf("[TUNNEL] Net stack init...")
 	t.gvisorStack = stack.New(stack.Options{
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
-		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},
+		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
 	})
 
 	SetTCPBuffers(t.gvisorStack)
@@ -139,6 +140,79 @@ func (t *TCPTunnel) setupExitNodeProxy(tunnelNIC tcpip.NICID) {
 
 	fwd := tcp.NewForwarder(t.gvisorStack, 0, 8192, t.handleExitTCP)
 	t.gvisorStack.SetTransportProtocolHandler(tcp.ProtocolNumber, fwd.HandlePacket)
+
+	// UDP forwarder: lets the exit carry UDP (e.g. QUIC/UDP:443) when the
+	// client opts into UDP tunnelling. Uses ordinary UDP sockets (net.Dial),
+	// so it needs no elevated privileges and works in the hardened sandbox.
+	ufwd := udp.NewForwarder(t.gvisorStack, t.handleExitUDP)
+	t.gvisorStack.SetTransportProtocolHandler(udp.ProtocolNumber, ufwd.HandlePacket)
+}
+
+// handleExitUDP bridges one in-tunnel UDP flow to a real UDP socket on the
+// exit host, relaying datagrams both ways until an idle timeout.
+func (t *TCPTunnel) handleExitUDP(r *udp.ForwarderRequest) {
+	id := r.ID()
+	dest := fmt.Sprintf("%s:%d", id.LocalAddress.String(), id.LocalPort)
+
+	var wq waiter.Queue
+	ep, tErr := r.CreateEndpoint(&wq)
+	if tErr != nil {
+		utils.Debugf("[EXIT-UDP] CreateEndpoint %s: %v", dest, tErr)
+		return
+	}
+	local := gonet.NewUDPConn(&wq, ep)
+
+	utils.SafeGo("exit.udpflow", func() {
+		remote, err := net.Dial("udp", dest)
+		if err != nil {
+			utils.Debugf("[EXIT-UDP] dial %s failed: %v", dest, err)
+			local.Close()
+			return
+		}
+		utils.Debugf("[EXIT-UDP] %s open", dest)
+
+		const idle = 60 * time.Second
+		done := make(chan struct{}, 2)
+
+		go func() { // client -> internet
+			buf := make([]byte, 64*1024)
+			for {
+				_ = local.SetReadDeadline(time.Now().Add(idle))
+				n, err := local.Read(buf)
+				if n > 0 {
+					if _, werr := remote.Write(buf[:n]); werr != nil {
+						break
+					}
+				}
+				if err != nil {
+					break
+				}
+			}
+			done <- struct{}{}
+		}()
+
+		go func() { // internet -> client
+			buf := make([]byte, 64*1024)
+			for {
+				_ = remote.SetReadDeadline(time.Now().Add(idle))
+				n, err := remote.Read(buf)
+				if n > 0 {
+					if _, werr := local.Write(buf[:n]); werr != nil {
+						break
+					}
+				}
+				if err != nil {
+					break
+				}
+			}
+			done <- struct{}{}
+		}()
+
+		<-done
+		local.Close()
+		remote.Close()
+		utils.Debugf("[EXIT-UDP] %s closed", dest)
+	})
 }
 
 func (t *TCPTunnel) handleExitTCP(r *tcp.ForwarderRequest) {
