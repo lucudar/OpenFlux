@@ -87,12 +87,17 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         // Forward non-DNS UDP (QUIC) over the transport. Off by default; only
         // enable against a UDP-capable exit node.
         let tunnelUDP = ((conf["tunnelUDP"] as? NSNumber)?.boolValue) ?? false
+        // RU-direct split tunnel: route Russian IP ranges outside the VPN (out
+        // the physical interface), everything else through it. Also cuts the
+        // number of flows on the doc transport, which is what triggers the
+        // close-1005 storms under heavy load.
+        let splitTunnelRU = ((conf["splitTunnelRU"] as? NSNumber)?.boolValue) ?? false
 
         // Turn on Go-side verbose logging in THIS (extension) process so the
         // app can pull transport reconnect events via handleAppMessage. The
         // yandex client path logs only connect/reconnect, not per-packet.
         OpenFluxSetDebug(1)
-        diag("startTunnel transport=\(transport) udp=\(tunnelUDP) availMem=\(availMemMB())MB")
+        diag("startTunnel transport=\(transport) udp=\(tunnelUDP) splitRU=\(splitTunnelRU) availMem=\(availMemMB())MB")
 
         // Virtual interface: capture all IPv4 + all DNS.
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
@@ -104,7 +109,13 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         // Exclude the transport's own backend (Yandex ranges) and the DoT DNS
         // servers so the extension's own connections bypass the tunnel instead
         // of looping back into it.
-        ipv4.excludedRoutes = Self.bypassRoutes
+        var excluded = Self.bypassRoutes
+        if splitTunnelRU {
+            let ru = RussiaRanges.excludedRoutes
+            excluded += ru
+            diag("split-tunnel RU on: \(ru.count) RU ranges bypass the VPN (direct)")
+        }
+        ipv4.excludedRoutes = excluded
         settings.ipv4Settings = ipv4
         settings.mtu = 1500
         // A benign in-tunnel DNS address: queries to it are captured and

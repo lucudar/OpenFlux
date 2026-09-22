@@ -67,6 +67,10 @@ targets:
     platform: iOS
     sources:
       - path: OpenFluxTunnel
+        excludes:
+          - "ru-cidr.txt"
+      - path: OpenFluxTunnel/ru-cidr.txt
+        buildPhase: resources
       - path: Lib
         buildPhase: none
     dependencies:

@@ -8,6 +8,7 @@ struct SettingsView: View {
     @AppStorage("socksPort") private var socksPort: String = "10808"
     @AppStorage("debugLog") private var debugLog: Bool = false
     @AppStorage("tunnelUDP") private var tunnelUDP: Bool = false
+    @AppStorage("splitTunnelRU") private var splitTunnelRU: Bool = true
 
     @Environment(\.dismiss) private var dismiss
     @State private var editing: Profile?
@@ -61,6 +62,9 @@ struct SettingsView: View {
 
     private var routingSection: some View {
         Section {
+            Toggle("Российские сайты — напрямую", isOn: $splitTunnelRU)
+            Text("Вкл = трафик к российским IP идёт мимо VPN (быстрее, и меньше нагрузка на туннель — меньше реконнектов). Остальное — через VPN. Меняется при следующем подключении.")
+                .font(.caption).foregroundColor(.secondary)
             Toggle("Туннелировать UDP / QUIC", isOn: $tunnelUDP)
             Text("Выкл = QUIC падает на TCP (работает на любом узле). Вкл = требуется UDP-совместимый узел. Меняется при следующем подключении.")
                 .font(.caption).foregroundColor(.secondary)

@@ -9,6 +9,7 @@ struct ContentView: View {
     @State private var showInfo = false
     @State private var spin = false
     @AppStorage("tunnelUDP") private var tunnelUDP: Bool = false
+    @AppStorage("splitTunnelRU") private var splitTunnelRU: Bool = true
 
     private var selected: Profile? { store.selected }
     private var canConnect: Bool { selected?.isComplete ?? false }
@@ -126,7 +127,7 @@ struct ContentView: View {
         } else if let p = selected {
             vpn.start(transport: p.transport, url: p.joinedURLs,
                       maxToken: p.maxToken, maxUid: p.maxUid,
-                      tunnelUDP: tunnelUDP)
+                      tunnelUDP: tunnelUDP, splitTunnelRU: splitTunnelRU)
         }
     }
 
