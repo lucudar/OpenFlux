@@ -60,5 +60,7 @@ a/
 stats.txt
 watch_stats.sh
 *.log
-openflux
+# Root build binary only — anchored so it doesn't match the ios-app/OpenFlux/
+# source directory on case-insensitive filesystems (Windows/macOS).
+/openflux
 *.bak
