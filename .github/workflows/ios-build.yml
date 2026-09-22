@@ -17,6 +17,9 @@ on:
     tags:
       - "v*"
 
+permissions:
+  contents: write        # needed to publish the IPA as a release asset
+
 jobs:
   build:
     runs-on: macos-15
@@ -79,9 +82,16 @@ jobs:
           (cd build && zip -qry OpenFlux-unsigned.ipa Payload)
           echo "Built:"; ls -lh build/OpenFlux-unsigned.ipa
 
-      - name: Upload unsigned IPA
-        uses: actions/upload-artifact@v4
-        with:
-          name: OpenFlux-unsigned-ipa
-          path: ios-app/build/OpenFlux-unsigned.ipa
-          if-no-files-found: error
+      # Published as a Release asset rather than an Actions artifact: release
+      # assets don't count against the Actions artifact storage quota, and give
+      # a stable download link.
+      - name: Publish IPA to a Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="ios-b${{ github.run_number }}"
+          gh release create "$TAG" ios-app/build/OpenFlux-unsigned.ipa \
+            --repo "${{ github.repository }}" \
+            --title "OpenFlux iOS unsigned ($TAG)" \
+            --notes "Unsigned IPA. Re-sign with your own certificate (Sideloadly / AltStore / ESign), then install on your device."
+          echo "Download: $(gh release view "$TAG" --repo "${{ github.repository }}" --json assets -q '.assets[0].url')"
