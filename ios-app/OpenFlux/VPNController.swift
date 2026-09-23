@@ -18,6 +18,15 @@ final class VPNController: ObservableObject {
     /// Whether we've already pulled the full on-disk history this session.
     private var didDumpLog = false
 
+    /// App Group shared with the packet-tunnel extension. The extension writes
+    /// its diagnostic log to a file in this container; we read it directly,
+    /// bypassing the sendProviderMessage IPC channel (which delivered nothing on
+    /// the user's signed build — only the app's own "polling" line showed).
+    private let appGroup = "group.com.p1neapplexpress-saharev.openflux"
+    private lazy var sharedLogURL: URL? = FileManager.default
+        .containerURL(forSecurityApplicationGroupIdentifier: appGroup)?
+        .appendingPathComponent("openflux-diag.log")
+
     init() {
         NotificationCenter.default.addObserver(
             self, selector: #selector(statusChanged),
@@ -120,9 +129,18 @@ final class VPNController: ObservableObject {
     }
 
     private func pullExtensionLog() {
+        // Preferred path: read the App Group shared file the extension writes to,
+        // directly off disk. No IPC handshake, always current, and it already
+        // contains the full persisted history (incl. the PREV SESSION verdict).
+        if let url = sharedLogURL,
+           let text = try? String(contentsOf: url, encoding: .utf8), !text.isEmpty {
+            let shown = text.count > 200_000 ? String(text.suffix(200_000)) : text
+            if shown != vpnLog { vpnLog = shown }
+            return
+        }
+        // Fallback: legacy sendProviderMessage polling, used only if the App
+        // Group container isn't available (e.g. entitlement not provisioned).
         guard let session = manager?.connection as? NETunnelProviderSession else { return }
-        // First pull the full on-disk history (survives extension restarts),
-        // then drain live tail lines on subsequent ticks.
         let cmd = didDumpLog ? "log" : "logdump"
         do {
             try session.sendProviderMessage(Data(cmd.utf8)) { [weak self] resp in

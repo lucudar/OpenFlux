@@ -56,11 +56,24 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private var healthTick = 0
     private var persistWrites = 0
 
+    /// App Group shared by the app + this extension, so the app can read the
+    /// diagnostic log DIRECTLY off disk. The sendProviderMessage IPC channel
+    /// proved unreliable on the user's signed build (only the app's own
+    /// "polling" line ever appeared, never an [EXT] line), so we no longer
+    /// depend on it for the log.
+    static let appGroup = "group.com.p1neapplexpress-saharev.openflux"
+
     /// Persistent diagnostic log file (survives extension process restarts, so
     /// an iOS memory-kill no longer erases the evidence of why we died).
+    /// Prefer the App Group container (readable by the main app); fall back to
+    /// the extension's private Caches if the group is somehow unavailable.
     private lazy var diagFileURL: URL? = {
-        let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
-        return dir?.appendingPathComponent("openflux-diag.log")
+        let fm = FileManager.default
+        if let g = fm.containerURL(forSecurityApplicationGroupIdentifier: Self.appGroup) {
+            return g.appendingPathComponent("openflux-diag.log")
+        }
+        return fm.urls(for: .cachesDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("openflux-diag.log")
     }()
 
     private func diag(_ s: String) {
