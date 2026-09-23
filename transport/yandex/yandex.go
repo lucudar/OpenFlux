@@ -3,6 +3,7 @@ package yandex
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -27,6 +28,11 @@ var (
 	cursorPayloadRe = regexp.MustCompile(`"cursor":"[^;]+;([^"]+)"`)
 	clientConfigRe  = regexp.MustCompile(`<script[^>]*id="client-config"[^>]*>(.*?)</script>`)
 )
+
+// errCaptcha: Yandex answered the doc open with its anti-bot CAPTCHA page
+// (disk.yandex.ru/i/... -> docs.yandex.ru/showcaptchafast). Retrying every few
+// seconds only keeps the ban alive, so this gets its own long backoff.
+var errCaptcha = errors.New("yandex anti-bot CAPTCHA")
 
 type YandexDocsInfo struct {
 	CookieStr   string
@@ -70,6 +76,9 @@ type YandexDocsTransport struct {
 	// against a peer that doesn't support the echo). See keepAliveLoop.
 	lastHBEcho atomic.Int64
 	sawHBEcho  atomic.Bool
+
+	// Consecutive CAPTCHA answers; drives captchaBackoff, reset on a real page.
+	captchaStreak atomic.Int32
 }
 
 func NewYandexDocsTransport(url string, config transport.TransportConfig) *YandexDocsTransport {
@@ -151,6 +160,11 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 		}
 
 		info, err := t.fetchDocInfo(t.url, userID)
+		if errors.Is(err, errCaptcha) {
+			t.scheduleCaptchaRetry(attempt)
+			return
+		}
+		t.captchaStreak.Store(0)
 		if err != nil {
 			utils.Debugf("[YDOCS] fetchDocInfo failed: %v", err)
 			t.scheduleReconnect(attempt)
@@ -438,6 +452,42 @@ func (t *YandexDocsTransport) scheduleReconnect(attempt int) {
 	t.connectToDoc(next)
 }
 
+// scheduleCaptchaRetry waits out a Yandex CAPTCHA instead of hammering it.
+// The normal reconnect backoff caps at ~8-12s (hundreds of hits/hour), which
+// is exactly what keeps the anti-bot ban active; here we pause for minutes.
+// The attempt counter is not advanced, so a long captcha never exhausts
+// MaxReconnectAttempts and kills the transport for good.
+func (t *YandexDocsTransport) scheduleCaptchaRetry(attempt int) {
+	streak := t.captchaStreak.Add(1)
+	d := captchaBackoff(int(streak))
+	utils.Debugf("[YDOCS] CAPTCHA from Yandex (anti-bot, streak %d) - pausing %v before next try", streak, d.Round(time.Second))
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if !t.IsRunning() {
+			return
+		}
+		time.Sleep(time.Second)
+	}
+	t.RecordReconnect()
+	t.connectToDoc(attempt)
+}
+
+// captchaBackoff: 1m, 2m, 4m, 8m, then 15m, +0-25% jitter.
+func captchaBackoff(n int) time.Duration {
+	if n < 1 {
+		n = 1
+	}
+	shift := n - 1
+	if shift > 4 {
+		shift = 4
+	}
+	d := time.Minute * time.Duration(1<<uint(shift))
+	if d > 15*time.Minute {
+		d = 15 * time.Minute
+	}
+	return d + time.Duration(rand.Int63n(int64(d/4)+1))
+}
+
 // reconnectBackoff returns an exponential backoff with jitter, capped at 30s.
 //
 // Each reconnect dials a brand new WebSocket, which the doc-collab server
@@ -495,6 +545,10 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 	var cookies []string
 	for _, c := range resp.Cookies() {
 		cookies = append(cookies, fmt.Sprintf("%s=%s", c.Name, c.Value))
+	}
+
+	if strings.Contains(resp.Request.URL.Path, "showcaptcha") {
+		return YandexDocsInfo{}, fmt.Errorf("%w (final %s)", errCaptcha, resp.Request.URL.Host+resp.Request.URL.Path)
 	}
 
 	matches := clientConfigRe.FindStringSubmatch(html)
