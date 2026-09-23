@@ -17,6 +17,11 @@ final class VPNController: ObservableObject {
     private var logTimer: Timer?
     /// Whether we've already pulled the full on-disk history this session.
     private var didDumpLog = false
+    /// How many VPN configs were loaded (a stale duplicate could mean we hold
+    /// the wrong session, so sendProviderMessage would go nowhere).
+    private var managerCount = 0
+    /// Poll counter, used to rate-limit the app-side channel diagnostics.
+    private var polls = 0
 
     /// App Group shared with the packet-tunnel extension. The extension writes
     /// its diagnostic log to a file in this container; we read it directly,
@@ -36,6 +41,7 @@ final class VPNController: ObservableObject {
 
     private func load() async {
         let managers = (try? await NETunnelProviderManager.loadAllFromPreferences()) ?? []
+        managerCount = managers.count
         manager = managers.first
         refreshStatus()
     }
@@ -116,8 +122,9 @@ final class VPNController: ObservableObject {
     private func startLogPolling() {
         guard logTimer == nil else { return }
         didDumpLog = false
+        polls = 0
         vpnLog = ""     // rebuilt from the extension's on-disk history (logdump)
-        appendVPNLog("[app] --- polling extension log ---")
+        appendVPNLog("[app] --- polling extension log --- (managers=\(managerCount), appgroup=\(sharedLogURL == nil ? "NO" : "yes"))")
         logTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.pullExtensionLog() }
         }
@@ -129,28 +136,44 @@ final class VPNController: ObservableObject {
     }
 
     private func pullExtensionLog() {
+        polls += 1
         // Preferred path: read the App Group shared file the extension writes to,
         // directly off disk. No IPC handshake, always current, and it already
         // contains the full persisted history (incl. the PREV SESSION verdict).
-        if let url = sharedLogURL,
-           let text = try? String(contentsOf: url, encoding: .utf8), !text.isEmpty {
-            let shown = text.count > 200_000 ? String(text.suffix(200_000)) : text
-            if shown != vpnLog { vpnLog = shown }
+        if let url = sharedLogURL {
+            if let text = try? String(contentsOf: url, encoding: .utf8), !text.isEmpty {
+                let shown = text.count > 200_000 ? String(text.suffix(200_000)) : text
+                if shown != vpnLog { vpnLog = shown }
+                return
+            }
+            if polls <= 2 { appendVPNLog("[app] app-group container present but log file empty/missing") }
+        }
+        // Fallback: legacy sendProviderMessage polling. Instrument every failure
+        // mode so the app's OWN (visible) log tells us which link is broken —
+        // the extension->app channel itself is the thing under investigation.
+        guard let conn = manager?.connection else {
+            if polls <= 2 { appendVPNLog("[app] no manager/connection (managers=\(managerCount))") }
             return
         }
-        // Fallback: legacy sendProviderMessage polling, used only if the App
-        // Group container isn't available (e.g. entitlement not provisioned).
-        guard let session = manager?.connection as? NETunnelProviderSession else { return }
+        guard let session = conn as? NETunnelProviderSession else {
+            if polls <= 2 { appendVPNLog("[app] connection is \(type(of: conn)), not NETunnelProviderSession") }
+            return
+        }
         let cmd = didDumpLog ? "log" : "logdump"
         do {
             try session.sendProviderMessage(Data(cmd.utf8)) { [weak self] resp in
-                guard let resp = resp, !resp.isEmpty,
-                      let s = String(data: resp, encoding: .utf8), !s.isEmpty else { return }
-                Task { @MainActor in self?.appendVPNLog(s) }
+                Task { @MainActor in
+                    guard let self = self else { return }
+                    if let resp = resp, let s = String(data: resp, encoding: .utf8), !s.isEmpty {
+                        self.appendVPNLog(s)
+                    } else if self.polls <= 3 {
+                        self.appendVPNLog("[app] IPC responded but empty (bytes=\(resp?.count ?? -1))")
+                    }
+                }
             }
             if cmd == "logdump" { didDumpLog = true }
         } catch {
-            // Extension may not be up yet; ignore and retry on the next tick.
+            if polls <= 3 { appendVPNLog("[app] sendProviderMessage threw: \(error.localizedDescription)") }
         }
     }
 
