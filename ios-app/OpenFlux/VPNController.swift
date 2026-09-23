@@ -15,6 +15,8 @@ final class VPNController: ObservableObject {
     private var manager: NETunnelProviderManager?
     private let extensionBundleId = "com.p1neapplexpress-saharev.openflux.tunnel"
     private var logTimer: Timer?
+    /// Whether we've already pulled the full on-disk history this session.
+    private var didDumpLog = false
 
     init() {
         NotificationCenter.default.addObserver(
@@ -104,6 +106,8 @@ final class VPNController: ObservableObject {
 
     private func startLogPolling() {
         guard logTimer == nil else { return }
+        didDumpLog = false
+        vpnLog = ""     // rebuilt from the extension's on-disk history (logdump)
         appendVPNLog("[app] --- polling extension log ---")
         logTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.pullExtensionLog() }
@@ -117,12 +121,16 @@ final class VPNController: ObservableObject {
 
     private func pullExtensionLog() {
         guard let session = manager?.connection as? NETunnelProviderSession else { return }
+        // First pull the full on-disk history (survives extension restarts),
+        // then drain live tail lines on subsequent ticks.
+        let cmd = didDumpLog ? "log" : "logdump"
         do {
-            try session.sendProviderMessage(Data("log".utf8)) { [weak self] resp in
+            try session.sendProviderMessage(Data(cmd.utf8)) { [weak self] resp in
                 guard let resp = resp, !resp.isEmpty,
                       let s = String(data: resp, encoding: .utf8), !s.isEmpty else { return }
                 Task { @MainActor in self?.appendVPNLog(s) }
             }
+            if cmd == "logdump" { didDumpLog = true }
         } catch {
             // Extension may not be up yet; ignore and retry on the next tick.
         }
@@ -130,8 +138,8 @@ final class VPNController: ObservableObject {
 
     private func appendVPNLog(_ s: String) {
         vpnLog += (vpnLog.isEmpty ? "" : "\n") + s
-        if vpnLog.count > 20000 {
-            vpnLog = String(vpnLog.suffix(20000))
+        if vpnLog.count > 200_000 {
+            vpnLog = String(vpnLog.suffix(200_000))
         }
     }
 }

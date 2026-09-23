@@ -54,15 +54,86 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private var diagLines: [String] = []
     private var lastConnState = false
     private var healthTick = 0
+    private var persistWrites = 0
+
+    /// Persistent diagnostic log file (survives extension process restarts, so
+    /// an iOS memory-kill no longer erases the evidence of why we died).
+    private lazy var diagFileURL: URL? = {
+        let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+        return dir?.appendingPathComponent("openflux-diag.log")
+    }()
 
     private func diag(_ s: String) {
-        let ts = Self.ts()
+        let line = "\(Self.ts()) [EXT] \(s)"
         logQueue.async {
-            self.diagLines.append("\(ts) [EXT] \(s)")
-            if self.diagLines.count > 400 {
-                self.diagLines.removeFirst(self.diagLines.count - 400)
+            self.diagLines.append(line)
+            if self.diagLines.count > 1200 {
+                self.diagLines.removeFirst(self.diagLines.count - 1200)
             }
+            self.persist(line)
         }
+    }
+
+    /// Append one line to the persistent file. logQueue-only (serial).
+    private func persist(_ line: String) {
+        guard let url = diagFileURL else { return }
+        let data = Data((line + "\n").utf8)
+        if let fh = try? FileHandle(forWritingTo: url) {
+            defer { try? fh.close() }
+            _ = try? fh.seekToEnd()
+            try? fh.write(contentsOf: data)
+        } else {
+            try? data.write(to: url)
+        }
+        persistWrites += 1
+        if persistWrites % 64 == 0 { rotateIfNeeded() }
+    }
+
+    /// Keep the persistent log bounded (trim to the last ~128 KB past 256 KB).
+    private func rotateIfNeeded() {
+        guard let url = diagFileURL,
+              let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = (attrs[.size] as? NSNumber)?.intValue, size > 262_144,
+              let data = try? Data(contentsOf: url) else { return }
+        try? data.suffix(131_072).write(to: url)
+    }
+
+    /// Read the PREVIOUS session's persisted log and emit a one-line verdict on
+    /// how it ended — the storm-vs-memory discriminator that a wiped in-memory
+    /// ring couldn't give us. Scans only from the last `startTunnel` marker.
+    private func logPreviousSessionSummary() {
+        guard let url = diagFileURL,
+              let text = try? String(contentsOf: url, encoding: .utf8),
+              !text.isEmpty else {
+            diag("no previous-session log (fresh install)")
+            return
+        }
+        let scope: Substring
+        if let r = text.range(of: "startTunnel", options: .backwards) {
+            let ls = text[..<r.lowerBound].lastIndex(of: "\n").map { text.index(after: $0) } ?? text.startIndex
+            scope = text[ls...]
+        } else {
+            scope = text[...]
+        }
+        var minMem = Int.max
+        for l in scope.split(separator: "\n") {
+            guard let r = l.range(of: "availMem=") else { continue }
+            let num = l[r.upperBound...].prefix { $0.isNumber }
+            if let v = Int(num) { minMem = min(minMem, v) }
+        }
+        func has(_ s: String) -> Bool { scope.range(of: s) != nil }
+        let verdict: String
+        if has("tearing down for relaunch") {
+            verdict = "transport lost > grace -> teardown (LOAD/storm)"
+        } else if has("did NOT connect") {
+            verdict = "transport never connected"
+        } else if has("stopTunnel reason=") {
+            verdict = "clean stopTunnel (user/system)"
+        } else {
+            verdict = "NO stop line -> KILLED (memory/jetsam or crash)"
+        }
+        let mem = minMem == Int.max ? "?" : "\(minMem)"
+        diag("=== PREV SESSION: \(verdict); minAvailMem=\(mem)MB ===")
     }
 
     private static func ts() -> String {
@@ -97,6 +168,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         // app can pull transport reconnect events via handleAppMessage. The
         // yandex client path logs only connect/reconnect, not per-packet.
         OpenFluxSetDebug(1)
+        logPreviousSessionSummary()
         diag("startTunnel transport=\(transport) udp=\(tunnelUDP) splitRU=\(splitTunnelRU) availMem=\(availMemMB())MB")
 
         // Virtual interface: capture all IPv4 + all DNS.
@@ -200,22 +272,28 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     /// traffic" zombie state.
     private func startHealthMonitor() {
         let timer = DispatchSource.makeTimerSource(queue: monitorQueue)
-        timer.schedule(deadline: .now() + 5, repeating: 5)
+        // 3s cadence: dense enough to capture the availMem trend before an iOS
+        // memory kill and to see transport flaps, without flooding the log.
+        timer.schedule(deadline: .now() + 3, repeating: 3)
         timer.setEventHandler { [weak self] in
             guard let self = self else { return }
             let connected = OpenFluxPacketTunnelConnected() != 0
-            // Log every ~15s (every 3rd tick) plus on any state change, so the
-            // memory trend is visible without flooding.
+            let mem = self.availMemMB()
             self.healthTick += 1
-            if connected != self.lastConnState || self.healthTick % 3 == 0 {
-                self.diag("health connected=\(connected) availMem=\(self.availMemMB())MB")
+            // Always log the memory + connection trace while diagnosing drops.
+            self.diag("health connected=\(connected) availMem=\(mem)MB tick=\(self.healthTick)")
+            if mem < 12 {
+                self.diag("LOW MEMORY availMem=\(mem)MB — near iOS extension kill threshold")
             }
+            self.drainGoLog()
             self.lastConnState = connected
             if connected {
                 self.lastConnected = Date()
                 return
             }
-            if Date().timeIntervalSince(self.lastConnected) > self.deadTransportGrace {
+            let down = Int(Date().timeIntervalSince(self.lastConnected))
+            self.diag("transport DOWN for \(down)s (grace \(Int(self.deadTransportGrace))s)")
+            if Double(down) > self.deadTransportGrace {
                 self.diag("transport lost >\(Int(self.deadTransportGrace))s; tearing down for relaunch")
                 self.stopHealthMonitor()
                 OpenFluxStopPacketTunnel()
@@ -227,6 +305,17 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         }
         healthTimer = timer
         timer.resume()
+    }
+
+    /// Drain the Go-side log ring into the diagnostic stream (so transport
+    /// reconnect events get persisted too). Single drain point — the app poll
+    /// no longer reads the Go log, which would race with this one.
+    private func drainGoLog() {
+        guard let c = OpenFluxReadLog() else { return }
+        let s = String(cString: c)
+        OpenFluxFreeString(c)
+        guard !s.isEmpty else { return }
+        for line in s.split(separator: "\n") { self.diag("[go] \(line)") }
     }
 
     private func stopHealthMonitor() {
@@ -241,21 +330,26 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         completionHandler()
     }
 
-    /// The app polls this to pull the extension's diagnostic log (it runs in a
-    /// separate process, so the log is invisible to the app otherwise). Also
-    /// drains the Go-side log ring when verbose logging is on.
+    /// The app polls this to pull the extension's diagnostic log.
+    ///  - "logdump": the full on-disk history (survives restarts) — sent once
+    ///    per connection so the app sees what happened before the last kill.
+    ///  - "log": drains the in-memory ring of new lines (Go transport lines are
+    ///    folded in by the health monitor's drainGoLog).
     override func handleAppMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)?) {
+        let cmd = String(data: messageData, encoding: .utf8) ?? "log"
         logQueue.async {
-            var out = self.diagLines
-            self.diagLines.removeAll(keepingCapacity: true)
-            // Append any Go-side lines (transport reconnects etc.) if present.
-            if let c = OpenFluxReadLog() {
-                let s = String(cString: c)
-                OpenFluxFreeString(c)
-                if !s.isEmpty {
-                    for line in s.split(separator: "\n") { out.append(String(line)) }
-                }
+            if cmd == "logdump" {
+                var text = ""
+                if let url = self.diagFileURL,
+                   let f = try? String(contentsOf: url, encoding: .utf8) { text = f }
+                // Clear the in-memory ring so the following "log" polls return
+                // only NEW lines (no duplication with the dump just returned).
+                self.diagLines.removeAll(keepingCapacity: true)
+                completionHandler?(Data(text.utf8))
+                return
             }
+            let out = self.diagLines
+            self.diagLines.removeAll(keepingCapacity: true)
             let joined = out.joined(separator: "\n")
             completionHandler?(joined.isEmpty ? Data() : Data(joined.utf8))
         }
