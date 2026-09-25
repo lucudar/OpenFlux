@@ -20,6 +20,7 @@ import (
 
 	"openflux/socks5"
 	"openflux/transport"
+	"openflux/transport/mailru"
 	"openflux/transport/oneme"
 	"openflux/transport/yandex"
 	"openflux/tunnel"
@@ -181,6 +182,12 @@ func OpenFluxStartClient(transportType, url, socksAddr, maxToken, maxUid *C.char
 	case "oneme":
 		uidint, _ := strconv.ParseInt(mUid, 10, 64)
 		t = transport.NewCompressedTransport(oneme.NewOneMeTransport(false, mToken, uidint, config))
+	case "mailru":
+		urls := splitDocURLs(docURL)
+		if len(urls) == 0 {
+			return C.int(startBadTransport)
+		}
+		t = transport.NewCompressedTransport(mailru.NewMailruDocsTransport(urls[0], config))
 	default:
 		utils.Debugf("[BRIDGE] Unknown transport type: %s", tt)
 		return C.int(startBadTransport)

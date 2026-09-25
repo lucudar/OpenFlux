@@ -222,6 +222,7 @@ struct ProfileEditor: View {
                 Section("Транспорт") {
                     Picker("Транспорт", selection: $transport) {
                         Text("Yandex Docs").tag("yandex")
+                        Text("Mail.ru").tag("mailru")
                         Text("MAX").tag("oneme")
                     }
                     .pickerStyle(.segmented)
@@ -258,7 +259,7 @@ struct ProfileEditor: View {
                     Image(systemName: "doc.text")
                         .foregroundColor(.secondary)
                         .font(.caption)
-                    TextField("https://disk.yandex.ru/i/...", text: $urls[i])
+                    TextField(transport == "mailru" ? "https://cloud.mail.ru/public/..." : "https://disk.yandex.ru/i/...", text: $urls[i])
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled(true)
                         .keyboardType(.URL)

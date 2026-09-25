@@ -21,6 +21,7 @@ import (
 
 	"openflux/network"
 	"openflux/transport"
+	"openflux/transport/mailru"
 	"openflux/transport/oneme"
 	"openflux/transport/yandex"
 	"openflux/utils"
@@ -98,6 +99,14 @@ func OpenFluxStartPacketTunnel(transportType, url, maxToken, maxUid *C.char, tun
 	case "oneme":
 		uidint, _ := strconv.ParseInt(mUid, 10, 64)
 		t = transport.NewCompressedTransport(oneme.NewOneMeTransport(false, mToken, uidint, config))
+	case "mailru":
+		// Mail.ru Docs (cloud.mail.ru/public/...). Single document; the exit must
+		// run --transport=mailru on the same link with --codec=legacy.
+		urls := splitDocURLs(docURL)
+		if len(urls) == 0 {
+			return C.int(startBadTransport)
+		}
+		t = transport.NewCompressedTransport(mailru.NewMailruDocsTransport(urls[0], config))
 	default:
 		return C.int(startBadTransport)
 	}
