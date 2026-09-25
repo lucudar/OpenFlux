@@ -32,46 +32,88 @@ final class VPNController: ObservableObject {
         .containerURL(forSecurityApplicationGroupIdentifier: appGroup)?
         .appendingPathComponent("openflux-diag.log")
 
+    /// On-demand is armed: iOS will (re)launch the tunnel by itself. While
+    /// armed the VPN counts as "on" for the UI even in the gaps between
+    /// relaunches, so a tap in such a gap turns it OFF instead of re-starting it
+    /// (the old button read only the momentary status and flipped back on).
+    @Published var armed = false
+    /// A user-requested stop is in flight; the button ignores taps meanwhile.
+    @Published var stopping = false
+
+    /// The VPN is on from the user's point of view (connected, connecting,
+    /// or armed to reconnect).
+    var isOn: Bool { !stopping && (active || armed) }
+
     init() {
         NotificationCenter.default.addObserver(
             self, selector: #selector(statusChanged),
             name: .NEVPNStatusDidChange, object: nil)
+        // Turning the VPN off in iOS Settings disables on-demand behind our
+        // back; reload so `armed` doesn't stay stale.
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(configChanged),
+            name: .NEVPNConfigurationChange, object: nil)
         Task { await load() }
     }
 
+    /// Loads our VPN configuration. An app only sees the configurations it
+    /// created, so every manager here is ours; extras are stale duplicates
+    /// (e.g. from reinstalls) that keep their own on-demand rules and can
+    /// relaunch the tunnel after we "stopped" the other one — remove them.
     private func load() async {
         let managers = (try? await NETunnelProviderManager.loadAllFromPreferences()) ?? []
         managerCount = managers.count
         manager = managers.first
+        for extra in managers.dropFirst() {
+            extra.isOnDemandEnabled = false
+            try? await extra.saveToPreferences()
+            extra.connection.stopVPNTunnel()
+            try? await extra.removeFromPreferences()
+        }
         refreshStatus()
     }
 
+    struct Options {
+        var tunnelUDP = false
+        var splitTunnelRU = true
+        var bypassLAN = true
+        var autoReconnect = true
+        var disconnectOnSleep = false
+        var deadGrace = 45
+        var batched = false
+    }
+
     func start(transport: String, url: String, maxToken: String, maxUid: String,
-               tunnelUDP: Bool = false, splitTunnelRU: Bool = true) {
+               options o: Options) {
+        guard !stopping else { return }
+        armed = o.autoReconnect
         Task {
+            if manager == nil { await load() }
             let m = manager ?? NETunnelProviderManager()
             let proto = NETunnelProviderProtocol()
             proto.providerBundleIdentifier = extensionBundleId
             proto.serverAddress = "OpenFlux"
+            proto.disconnectOnSleep = o.disconnectOnSleep
             proto.providerConfiguration = [
                 "transport": transport, "url": url,
                 "maxToken": maxToken, "maxUid": maxUid,
-                "tunnelUDP": NSNumber(value: tunnelUDP),
-                "splitTunnelRU": NSNumber(value: splitTunnelRU),
+                "tunnelUDP": NSNumber(value: o.tunnelUDP),
+                "splitTunnelRU": NSNumber(value: o.splitTunnelRU),
+                "bypassLAN": NSNumber(value: o.bypassLAN),
+                "deadGrace": NSNumber(value: o.deadGrace),
+                "batched": NSNumber(value: o.batched),
             ]
             m.protocolConfiguration = proto
             m.localizedDescription = "OpenFlux"
             m.isEnabled = true
 
-            // On-demand: reconnect automatically whenever there is a network,
-            // including after the extension tears itself down on a dead
-            // transport (see PacketTunnelProvider health monitor). Without this,
-            // a dropped tunnel stays dropped until the user reconnects by hand —
-            // the main cause of "туннель отваливается".
+            // On-demand (optional): iOS relaunches the tunnel whenever there
+            // is a network, incl. after the extension tears itself down on a
+            // dead transport (PacketTunnelProvider health monitor).
             let connectRule = NEOnDemandRuleConnect()
             connectRule.interfaceTypeMatch = .any
             m.onDemandRules = [connectRule]
-            m.isOnDemandEnabled = true
+            m.isOnDemandEnabled = o.autoReconnect
 
             do {
                 try await m.saveToPreferences()
@@ -79,30 +121,89 @@ final class VPNController: ObservableObject {
                 self.manager = m
                 try m.connection.startVPNTunnel()
             } catch {
+                self.armed = false
                 self.status = "Error: \(error.localizedDescription)"
             }
+            refreshStatus()
         }
     }
 
+    /// Turns the VPN fully off. On-demand is disarmed and SAVED before the
+    /// stop, otherwise iOS immediately relaunches the tunnel.
     func stop() {
-        // Disable on-demand first, otherwise the system immediately reconnects
-        // the tunnel and the user can't actually turn it off.
+        guard !stopping else { return }
+        stopping = true
+        armed = false
         Task {
-            guard let m = manager else { return }
-            m.isOnDemandEnabled = false
-            do {
-                try await m.saveToPreferences()
-                try await m.loadFromPreferences()
-            } catch {
-                self.status = "Error: \(error.localizedDescription)"
+            // Fresh copies: the cached manager may be stale or missing.
+            let managers = (try? await NETunnelProviderManager.loadAllFromPreferences()) ?? []
+            for m in managers {
+                if m.isOnDemandEnabled {
+                    m.isOnDemandEnabled = false
+                    do { try await m.saveToPreferences() } catch {
+                        self.status = "Error: \(error.localizedDescription)"
+                    }
+                }
+                m.connection.stopVPNTunnel()
             }
-            m.connection.stopVPNTunnel()
+            if let first = managers.first { manager = first }
+            // A relaunch that was already in flight when on-demand got disarmed
+            // can still come up; wait for it to settle and stop it again.
+            for _ in 0..<8 {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                let live = managers.filter {
+                    let st = $0.connection.status
+                    return st != .disconnected && st != .invalid
+                }
+                if live.isEmpty { break }
+                live.forEach { $0.connection.stopVPNTunnel() }
+            }
+            stopping = false
+            refreshStatus()
+        }
+    }
+
+    /// Removes the iOS VPN configuration entirely (Settings → VPN entry).
+    /// Fixes a stale/duplicate profile without reinstalling the app; the
+    /// next connect creates a fresh one.
+    func resetConfiguration() {
+        stopping = true
+        armed = false
+        Task {
+            let managers = (try? await NETunnelProviderManager.loadAllFromPreferences()) ?? []
+            for m in managers {
+                m.isOnDemandEnabled = false
+                try? await m.saveToPreferences()
+                m.connection.stopVPNTunnel()
+                try? await m.removeFromPreferences()
+            }
+            manager = nil
+            managerCount = 0
+            stopping = false
+            refreshStatus()
+        }
+    }
+
+    /// Clears the extension's persisted diagnostic log and the on-screen copy.
+    func clearLog() {
+        vpnLog = ""
+        if let url = sharedLogURL { try? FileManager.default.removeItem(at: url) }
+        if let session = manager?.connection as? NETunnelProviderSession {
+            try? session.sendProviderMessage(Data("clearlog".utf8)) { _ in }
         }
     }
 
     @objc private func statusChanged() { refreshStatus() }
 
+    @objc private func configChanged() {
+        Task { @MainActor in
+            try? await manager?.loadFromPreferences()
+            refreshStatus()
+        }
+    }
+
     private func refreshStatus() {
+        if !stopping { armed = manager?.isOnDemandEnabled ?? false }
         guard let conn = manager?.connection else { active = false; status = "Disconnected"; return }
         switch conn.status {
         case .connected:     status = "Connected";     active = true

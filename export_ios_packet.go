@@ -48,7 +48,30 @@ var (
 	ptCtx       context.Context
 	ptCancel    context.CancelFunc
 	ptTunnelUDP bool // forward non-DNS UDP (QUIC) over the transport (needs a UDP-capable exit)
+	// ptBatched selects the app-layer codec for the next start: false = legacy
+	// per-packet LZ4 (our hand-run exits, --codec=legacy), true = batched zstd
+	// (WEB PANEL PROXY exits, --codec=batched). Must match the exit.
+	ptBatched bool
 )
+
+// OpenFluxSetCodec picks the codec for the next OpenFluxStartPacketTunnel:
+// 0 = legacy, 1 = batched. Kept as a separate setter so the start ABI (and the
+// Swift call site) stays unchanged.
+//
+//export OpenFluxSetCodec
+func OpenFluxSetCodec(batched C.int) {
+	ptMu.Lock()
+	ptBatched = batched != 0
+	ptMu.Unlock()
+}
+
+// wrapCodec applies the selected app-layer codec (see ptBatched). ptMu held.
+func wrapCodec(inner transport.Transport) transport.Transport {
+	if ptBatched {
+		return transport.NewBatchedTransport(inner)
+	}
+	return transport.NewCompressedTransport(inner)
+}
 
 //export OpenFluxStartPacketTunnel
 func OpenFluxStartPacketTunnel(transportType, url, maxToken, maxUid *C.char, tunnelUDP C.int) (rc C.int) {
@@ -91,22 +114,21 @@ func OpenFluxStartPacketTunnel(transportType, url, maxToken, maxUid *C.char, tun
 		for i, u := range urls {
 			subs[i] = yandex.NewYandexDocsTransport(u, config)
 		}
-		// Legacy per-packet LZ4 codec. On the 32 MB-capped Network Extension
-		// (GCPercent=10) zstd's larger footprint costs more GC pauses and CPU than
-		// LZ4, which hurt interactive latency in real use, so iOS stays on legacy.
-		// Must match the exit's --codec=legacy.
-		t = transport.NewCompressedTransport(transport.NewMultiTransport(subs))
+		// Legacy per-packet LZ4 by default: on the 32 MB-capped Network
+		// Extension zstd's larger footprint costs more GC pauses than LZ4.
+		// Batched only when the profile targets a panel (--codec=batched) exit.
+		t = wrapCodec(transport.NewMultiTransport(subs))
 	case "oneme":
 		uidint, _ := strconv.ParseInt(mUid, 10, 64)
-		t = transport.NewCompressedTransport(oneme.NewOneMeTransport(false, mToken, uidint, config))
+		t = wrapCodec(oneme.NewOneMeTransport(false, mToken, uidint, config))
 	case "mailru":
 		// Mail.ru Docs (cloud.mail.ru/public/...). Single document; the exit must
-		// run --transport=mailru on the same link with --codec=legacy.
+		// run --transport=mailru on the same link with the matching --codec.
 		urls := splitDocURLs(docURL)
 		if len(urls) == 0 {
 			return C.int(startBadTransport)
 		}
-		t = transport.NewCompressedTransport(mailru.NewMailruDocsTransport(urls[0], config))
+		t = wrapCodec(mailru.NewMailruDocsTransport(urls[0], config))
 	default:
 		return C.int(startBadTransport)
 	}
@@ -129,7 +151,7 @@ func OpenFluxStartPacketTunnel(transportType, url, maxToken, maxUid *C.char, tun
 	ptOutQ = outQ
 	ptCtx, ptCancel = context.WithCancel(context.Background())
 	ptOn = true
-	utils.Debugf("[PKT] L3 packet tunnel started (transport %s)", tt)
+	utils.Debugf("[PKT] L3 packet tunnel started (transport %s, batched=%v)", tt, ptBatched)
 	return C.int(startOK)
 }
 

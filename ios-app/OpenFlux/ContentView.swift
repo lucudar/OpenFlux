@@ -10,11 +10,16 @@ struct ContentView: View {
     @State private var spin = false
     @AppStorage("tunnelUDP") private var tunnelUDP: Bool = false
     @AppStorage("splitTunnelRU") private var splitTunnelRU: Bool = true
+    @AppStorage("bypassLAN") private var bypassLAN: Bool = true
+    @AppStorage("autoReconnect") private var autoReconnect: Bool = true
+    @AppStorage("disconnectOnSleep") private var disconnectOnSleep: Bool = false
+    @AppStorage("deadGrace") private var deadGrace: Int = 45
 
     private var selected: Profile? { store.selected }
     private var canConnect: Bool { selected?.isComplete ?? false }
-    private var isConnected: Bool { vpn.active && vpn.status == "Connected" }
-    private var isConnecting: Bool { vpn.active && vpn.status != "Connected" }
+    private var isConnected: Bool { vpn.isOn && vpn.status == "Connected" }
+    /// Connecting, or armed on-demand waiting to relaunch — still "on".
+    private var isConnecting: Bool { vpn.isOn && vpn.status != "Connected" }
 
     /// Accent colour reflects the tunnel state at a glance.
     private var accent: Color {
@@ -105,29 +110,42 @@ struct ContentView: View {
                         .font(.system(size: 52, weight: .semibold))
                         .foregroundColor(accent)
                     Text(buttonText)
+                        .multilineTextAlignment(.center)
                         .font(.headline)
                         .foregroundColor(.primary)
                 }
             }
         }
         .buttonStyle(.plain)
-        .disabled(!vpn.active && !canConnect)
-        .opacity((!vpn.active && !canConnect) ? 0.5 : 1)
+        .disabled(vpn.stopping || (!vpn.isOn && !canConnect))
+        .opacity((vpn.stopping || (!vpn.isOn && !canConnect)) ? 0.5 : 1)
     }
 
     private var buttonText: String {
+        if vpn.stopping { return "Отключение…" }
         if isConnected { return "Отключить" }
-        if isConnecting { return "Подключение…" }
+        if isConnecting { return "Подключение…\nнажмите, чтобы отменить" }
         return "Подключить"
     }
 
+    /// Acts on the user's intent, not the momentary status: while the VPN is
+    /// on (connected, connecting or armed to reconnect) a tap always turns it
+    /// off; it never re-starts it from a transient "disconnected" gap.
     private func toggle() {
-        if vpn.active {
+        if vpn.stopping { return }
+        if vpn.isOn {
             vpn.stop()
         } else if let p = selected {
+            var o = VPNController.Options()
+            o.tunnelUDP = tunnelUDP
+            o.splitTunnelRU = splitTunnelRU
+            o.bypassLAN = bypassLAN
+            o.autoReconnect = autoReconnect
+            o.disconnectOnSleep = disconnectOnSleep
+            o.deadGrace = deadGrace
+            o.batched = p.batched
             vpn.start(transport: p.transport, url: p.joinedURLs,
-                      maxToken: p.maxToken, maxUid: p.maxUid,
-                      tunnelUDP: tunnelUDP, splitTunnelRU: splitTunnelRU)
+                      maxToken: p.maxToken, maxUid: p.maxUid, options: o)
         }
     }
 
@@ -152,6 +170,7 @@ struct ContentView: View {
     }
 
     private var statusText: String {
+        if vpn.stopping { return "Отключение…" }
         if isConnected { return "Подключено" }
         if isConnecting { return "Подключение…" }
         return "Отключено"
@@ -213,7 +232,7 @@ struct ContentView: View {
             .background(Color(.secondarySystemBackground))
             .clipShape(RoundedRectangle(cornerRadius: 16))
         }
-        .disabled(vpn.active)
+        .disabled(vpn.isOn)
     }
 
     // MARK: connectivity check

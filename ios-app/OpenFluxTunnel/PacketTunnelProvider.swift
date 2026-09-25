@@ -45,7 +45,21 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     /// in-process reconnect and hand control back to the system (on-demand then
     /// relaunches the extension fresh). The Go transport reconnects with backoff
     /// on its own; this is the outer safety net for a wedged session.
-    private let deadTransportGrace: TimeInterval = 45
+    /// Overridable from the app ("deadGrace" in providerConfiguration).
+    private var deadTransportGrace: TimeInterval = 45
+
+    /// Private LAN / link-local ranges, kept off the tunnel when "bypassLAN"
+    /// is on (router admin page, printers, AirPlay, local file shares).
+    /// 10/8 is left out: it contains our own 10.10.10.2 tunnel address.
+    static let lanRoutes: [NEIPv4Route] = {
+        let cidrs: [(String, String)] = [
+            ("172.16.0.0", "255.240.0.0"),
+            ("192.168.0.0", "255.255.0.0"),
+            ("169.254.0.0", "255.255.0.0"),
+            ("224.0.0.0", "240.0.0.0"),
+        ]
+        return cidrs.map { NEIPv4Route(destinationAddress: $0.0, subnetMask: $0.1) }
+    }()
 
     // ---- diagnostic log, pulled by the app over handleAppMessage ----
     // The extension is a separate process, so its logs aren't visible in the
@@ -176,13 +190,20 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         // number of flows on the doc transport, which is what triggers the
         // close-1005 storms under heavy load.
         let splitTunnelRU = ((conf["splitTunnelRU"] as? NSNumber)?.boolValue) ?? false
+        let bypassLAN = ((conf["bypassLAN"] as? NSNumber)?.boolValue) ?? true
+        // Codec must match the exit: batched for WEB PANEL PROXY exits.
+        let batched = ((conf["batched"] as? NSNumber)?.boolValue) ?? false
+        if let g = (conf["deadGrace"] as? NSNumber)?.doubleValue, g >= 15 {
+            deadTransportGrace = g
+        }
 
         // Turn on Go-side verbose logging in THIS (extension) process so the
         // app can pull transport reconnect events via handleAppMessage. The
         // yandex client path logs only connect/reconnect, not per-packet.
         OpenFluxSetDebug(1)
         logPreviousSessionSummary()
-        diag("startTunnel transport=\(transport) udp=\(tunnelUDP) splitRU=\(splitTunnelRU) availMem=\(availMemMB())MB")
+        OpenFluxSetCodec(batched ? 1 : 0)
+        diag("startTunnel transport=\(transport) codec=\(batched ? "batched" : "legacy") udp=\(tunnelUDP) splitRU=\(splitTunnelRU) lan=\(bypassLAN) grace=\(Int(deadTransportGrace))s availMem=\(availMemMB())MB")
 
         // Virtual interface: capture all IPv4 + all DNS.
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
@@ -195,6 +216,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         // servers so the extension's own connections bypass the tunnel instead
         // of looping back into it.
         var excluded = Self.bypassRoutes
+        if bypassLAN {
+            excluded += Self.lanRoutes
+        }
         if splitTunnelRU {
             let ru = RussiaRanges.excludedRoutes
             excluded += ru
@@ -351,6 +375,12 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     override func handleAppMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)?) {
         let cmd = String(data: messageData, encoding: .utf8) ?? "log"
         logQueue.async {
+            if cmd == "clearlog" {
+                self.diagLines.removeAll(keepingCapacity: true)
+                if let url = self.diagFileURL { try? Data().write(to: url) }
+                completionHandler?(Data())
+                return
+            }
             if cmd == "logdump" {
                 var text = ""
                 if let url = self.diagFileURL,

@@ -12,20 +12,27 @@ struct Profile: Identifiable, Codable, Equatable {
     var urls: [String]      // Yandex document URLs (one or more)
     var maxToken: String    // MAX token (oneme)
     var maxUid: String      // MAX user id (oneme)
+    /// App-layer codec; must match the exit's --codec. "legacy" for our
+    /// hand-run exits, "batched" for WEB PANEL PROXY (2.4+) exits.
+    var codec: String
 
     init(id: UUID = UUID(), name: String, transport: String = "yandex",
-         urls: [String] = [], maxToken: String = "", maxUid: String = "") {
+         urls: [String] = [], maxToken: String = "", maxUid: String = "",
+         codec: String = "legacy") {
         self.id = id
         self.name = name
         self.transport = transport
         self.urls = urls
         self.maxToken = maxToken
         self.maxUid = maxUid
+        self.codec = codec
     }
+
+    var batched: Bool { codec == "batched" }
 
     // Backward-compatible decode: earlier builds stored a single `url` string.
     private enum CodingKeys: String, CodingKey {
-        case id, name, transport, urls, url, maxToken, maxUid
+        case id, name, transport, urls, url, maxToken, maxUid, codec
     }
 
     init(from decoder: Decoder) throws {
@@ -35,6 +42,7 @@ struct Profile: Identifiable, Codable, Equatable {
         transport = (try? c.decode(String.self, forKey: .transport)) ?? "yandex"
         maxToken = (try? c.decode(String.self, forKey: .maxToken)) ?? ""
         maxUid = (try? c.decode(String.self, forKey: .maxUid)) ?? ""
+        codec = (try? c.decode(String.self, forKey: .codec)) ?? "legacy"
         if let arr = try? c.decode([String].self, forKey: .urls) {
             urls = arr
         } else if let single = try? c.decode(String.self, forKey: .url) {
@@ -52,6 +60,7 @@ struct Profile: Identifiable, Codable, Equatable {
         try c.encode(urls, forKey: .urls)
         try c.encode(maxToken, forKey: .maxToken)
         try c.encode(maxUid, forKey: .maxUid)
+        try c.encode(codec, forKey: .codec)
     }
 
     /// Non-empty, trimmed document URLs.
@@ -75,11 +84,12 @@ struct Profile: Identifiable, Codable, Equatable {
 
     /// Short human summary of the transport target for the profile row.
     var subtitle: String {
-        if transport == "oneme" { return "MAX • uid \(maxUid)" }
+        let panel = batched ? "панель • " : ""
+        if transport == "oneme" { return "\(panel)MAX • uid \(maxUid)" }
         let n = cleanURLs.count
         if n == 0 { return "нет документов" }
-        if n == 1 { return primaryURL }
-        return "\(n) документа • \(primaryURL)"
+        if n == 1 { return panel + primaryURL }
+        return "\(panel)\(n) документа • \(primaryURL)"
     }
 }
 
