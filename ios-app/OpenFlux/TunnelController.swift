@@ -23,6 +23,15 @@ final class TunnelController: ObservableObject {
     @Published var log: String = ""
     @Published var stats: String = ""
 
+    /// Result of the last connectivity check, shown on the main screen.
+    enum CheckState: Equatable {
+        case idle
+        case running
+        case ok(ip: String, ms: Int)
+        case failed(String)
+    }
+    @Published var check: CheckState = .idle
+
     private var timer: Timer?
 
     /// Local SOCKS5 listen address for the currently running session.
@@ -111,6 +120,9 @@ final class TunnelController: ObservableObject {
     /// Connectivity check for the system VPN path: a plain request that, when
     /// the VPN is up, is carried through the tunnel. Result goes to the log.
     func testConnectivity() {
+        if check == .running { return }
+        check = .running
+        let started = Date()
         appendLog("[app] проверка доступности…")
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 20
@@ -119,12 +131,17 @@ final class TunnelController: ObservableObject {
         let url = URL(string: "http://ifconfig.me/ip")!
         session.dataTask(with: url) { [weak self] data, _, err in
             Task { @MainActor in
+                let ms = Int(Date().timeIntervalSince(started) * 1000)
                 if let err = err {
                     self?.appendLog("[app] тест не прошёл: \(err.localizedDescription)")
+                    self?.check = .failed(err.localizedDescription)
                 } else if let data = data, let body = String(data: data, encoding: .utf8) {
-                    self?.appendLog("[app] OK, внешний IP: \(body.trimmingCharacters(in: .whitespacesAndNewlines))")
+                    let ip = body.trimmingCharacters(in: .whitespacesAndNewlines)
+                    self?.appendLog("[app] OK, внешний IP: \(ip) (\(ms) мс)")
+                    self?.check = .ok(ip: ip, ms: ms)
                 } else {
                     self?.appendLog("[app] тест: пустой ответ")
+                    self?.check = .failed("пустой ответ")
                 }
             }
         }.resume()

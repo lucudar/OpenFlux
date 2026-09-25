@@ -44,6 +44,9 @@ final class VPNController: ObservableObject {
     /// or armed to reconnect).
     var isOn: Bool { !stopping && (active || armed) }
 
+    /// When the current session reached "connected" (for the session timer).
+    var connectedDate: Date? { manager?.connection.connectedDate }
+
     init() {
         NotificationCenter.default.addObserver(
             self, selector: #selector(statusChanged),
