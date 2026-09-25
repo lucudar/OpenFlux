@@ -11,21 +11,13 @@ struct InfoView: View {
 
     var body: some View {
         NavigationView {
-            ZStack {
-            AppBackground()
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
-                    VStack(spacing: 10) {
-                        LogoMark().frame(width: 84, height: 84)
-                            .shadow(color: Theme.cyan.opacity(0.4), radius: 18)
-                        Text("OpenFlux")
-                            .font(.system(.title, design: .rounded).weight(.bold))
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("OpenFlux").font(.title2).bold()
                         Text("TCP-туннель через скрытый транспорт. Клиент поднимает локальный SOCKS5 и системный VPN, трафик идёт через exit-node.")
-                            .font(.footnote).foregroundColor(.white.opacity(0.6))
-                            .multilineTextAlignment(.center)
+                            .font(.footnote).foregroundColor(.secondary)
                     }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 8)
 
                     VStack(alignment: .leading, spacing: 12) {
                         Text("Поддержать разработку ♥")
@@ -38,16 +30,16 @@ struct InfoView: View {
 
                         if let c = copied {
                             Label("\(c) скопирован", systemImage: "checkmark.circle.fill")
-                                .font(.caption).foregroundColor(Theme.teal)
+                                .font(.caption).foregroundColor(.green)
                         }
                     }
                     .padding()
-                    .glassCard()
+                    .background(Color(.secondarySystemBackground))
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
 
                     Spacer(minLength: 0)
                 }
                 .padding()
-            }
             }
             .navigationTitle("О приложении")
             .navigationBarTitleDisplayMode(.inline)
@@ -80,8 +72,8 @@ struct InfoView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(10)
-            .background(RoundedRectangle(cornerRadius: 12, style: .continuous)
-                            .fill(Color.white.opacity(0.06)))
+            .background(Color(.tertiarySystemBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 8))
         }
         .buttonStyle(.plain)
     }
