@@ -28,6 +28,13 @@ final class VPNController: ObservableObject {
     /// bypassing the sendProviderMessage IPC channel (which delivered nothing on
     /// the user's signed build — only the app's own "polling" line showed).
     private let appGroup = "group.com.p1neapplexpress-saharev.openflux"
+    /// Flag written by the extension when the user switches the VPN off from
+    /// iOS (Settings / Control Center); see PacketTunnelProvider.userOffKey.
+    private let shared = UserDefaults(suiteName: "group.com.p1neapplexpress-saharev.openflux")
+    private let userOffKey = "userSwitchedOff"
+    private var userSwitchedOff: Bool { shared?.bool(forKey: userOffKey) ?? false }
+    private var disarming = false
+
     private lazy var sharedLogURL: URL? = FileManager.default
         .containerURL(forSecurityApplicationGroupIdentifier: appGroup)?
         .appendingPathComponent("openflux-diag.log")
@@ -90,6 +97,9 @@ final class VPNController: ObservableObject {
                options o: Options) {
         guard !stopping else { return }
         armed = o.autoReconnect
+        // Cleared before on-demand is re-armed, or the extension would refuse
+        // an on-demand launch that races our own start.
+        shared?.set(false, forKey: userOffKey)
         Task {
             if manager == nil { await load() }
             let m = manager ?? NETunnelProviderManager()
@@ -166,6 +176,20 @@ final class VPNController: ObservableObject {
         }
     }
 
+    /// The user switched the VPN off from iOS while on-demand was armed: the
+    /// extension refuses the relaunches, and here we disarm on-demand for good
+    /// so iOS stops trying and the app shows "off".
+    private func disarmAfterSystemStop() {
+        guard !disarming, !stopping, let m = manager, m.isOnDemandEnabled else { return }
+        disarming = true
+        Task {
+            m.isOnDemandEnabled = false
+            try? await m.saveToPreferences()
+            disarming = false
+            refreshStatus()
+        }
+    }
+
     /// Removes the iOS VPN configuration entirely (Settings → VPN entry).
     /// Fixes a stale/duplicate profile without reinstalling the app; the
     /// next connect creates a fresh one.
@@ -206,8 +230,9 @@ final class VPNController: ObservableObject {
     }
 
     private func refreshStatus() {
-        if !stopping { armed = manager?.isOnDemandEnabled ?? false }
+        if !stopping { armed = (manager?.isOnDemandEnabled ?? false) && !userSwitchedOff }
         guard let conn = manager?.connection else { active = false; status = "Disconnected"; return }
+        if conn.status == .disconnected && userSwitchedOff { disarmAfterSystemStop() }
         switch conn.status {
         case .connected:     status = "Connected";     active = true
         case .connecting:    status = "Connecting…";   active = true

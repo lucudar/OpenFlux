@@ -77,6 +77,14 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     /// depend on it for the log.
     static let appGroup = "group.com.p1neapplexpress-saharev.openflux"
 
+    /// Set when the user switches the VPN off (iOS Settings, the Control
+    /// Center VPN toggle or our own button). On-demand would otherwise bring
+    /// the tunnel straight back, so on-demand relaunches are refused until the
+    /// user starts it again by hand. Shared with the app, which also disarms
+    /// on-demand once it sees the flag.
+    static let userOffKey = "userSwitchedOff"
+    static let shared = UserDefaults(suiteName: appGroup) ?? .standard
+
     /// Persistent diagnostic log file (survives extension process restarts, so
     /// an iOS memory-kill no longer erases the evidence of why we died).
     /// Prefer the App Group container (readable by the main app); fall back to
@@ -177,6 +185,14 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     override func startTunnel(options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void) {
+        let onDemand = (options?["is-on-demand"] as? NSNumber)?.boolValue ?? false
+        if onDemand && Self.shared.bool(forKey: Self.userOffKey) {
+            diag("on-demand relaunch refused: VPN was switched off by the user")
+            completionHandler(NSError(domain: "OpenFlux", code: -1003,
+                userInfo: [NSLocalizedDescriptionKey: "switched off by the user"]))
+            return
+        }
+        Self.shared.set(false, forKey: Self.userOffKey)
         let conf = (protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration ?? [:]
         let transport = (conf["transport"] as? String) ?? "yandex"
         let url = (conf["url"] as? String) ?? ""
@@ -362,6 +378,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
     override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
         diag("stopTunnel reason=\(reason.rawValue) availMem=\(availMemMB())MB")
+        if reason == .userInitiated {
+            Self.shared.set(true, forKey: Self.userOffKey)
+        }
         stopHealthMonitor()
         OpenFluxStopPacketTunnel()
         completionHandler()
