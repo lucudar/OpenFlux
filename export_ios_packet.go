@@ -122,13 +122,23 @@ func OpenFluxStartPacketTunnel(transportType, url, maxToken, maxUid *C.char, tun
 		uidint, _ := strconv.ParseInt(mUid, 10, 64)
 		t = wrapCodec(oneme.NewOneMeTransport(false, mToken, uidint, config))
 	case "mailru":
-		// Mail.ru Docs (cloud.mail.ru/public/...). Single document; the exit must
-		// run --transport=mailru on the same link with the matching --codec.
+		// Mail.ru Docs (cloud.mail.ru/public/...). The exit must run
+		// --transport=mailru with the same documents in the same order and the
+		// matching --codec. Several documents: codec per channel, MultiTransport
+		// outside (it pins flows by IP header), as in main.go.
 		urls := splitDocURLs(docURL)
 		if len(urls) == 0 {
 			return C.int(startBadTransport)
 		}
-		t = wrapCodec(mailru.NewMailruDocsTransport(urls[0], config))
+		if len(urls) == 1 {
+			t = wrapCodec(mailru.NewMailruDocsTransport(urls[0], config))
+		} else {
+			subs := make([]transport.Transport, len(urls))
+			for i, u := range urls {
+				subs[i] = wrapCodec(mailru.NewMailruDocsTransport(u, config))
+			}
+			t = transport.NewMultiTransport(subs)
+		}
 	default:
 		return C.int(startBadTransport)
 	}

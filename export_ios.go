@@ -187,7 +187,15 @@ func OpenFluxStartClient(transportType, url, socksAddr, maxToken, maxUid *C.char
 		if len(urls) == 0 {
 			return C.int(startBadTransport)
 		}
-		t = transport.NewCompressedTransport(mailru.NewMailruDocsTransport(urls[0], config))
+		if len(urls) == 1 {
+			t = transport.NewCompressedTransport(mailru.NewMailruDocsTransport(urls[0], config))
+		} else {
+			subs := make([]transport.Transport, len(urls))
+			for i, u := range urls {
+				subs[i] = transport.NewCompressedTransport(mailru.NewMailruDocsTransport(u, config))
+			}
+			t = transport.NewMultiTransport(subs)
+		}
 	default:
 		utils.Debugf("[BRIDGE] Unknown transport type: %s", tt)
 		return C.int(startBadTransport)

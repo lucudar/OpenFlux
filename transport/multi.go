@@ -37,6 +37,13 @@ type MultiTransport struct {
 	lastSent     []atomic.Int64
 	unackedSince []atomic.Int64
 
+	// Flow -> channel learned from inbound (slot = flowHash % len, value =
+	// channel+1, 0 = unknown). Replies follow the channel the peer chose for a
+	// flow, so the two ends agree even when their channel sets differ (e.g. a
+	// single-document client talking to a multi-document exit). Collisions only
+	// cost a sub-optimal channel choice, never correctness.
+	affinity [affinitySlots]atomic.Uint32
+
 	mu sync.RWMutex
 	cb func([]byte)
 }
@@ -48,6 +55,8 @@ type MultiTransport struct {
 // flagged channel its lastSent ages past this window, so it becomes eligible
 // again and is retried). A var, not a const, so tests can shrink it.
 var healthWindow = 6 * time.Second
+
+const affinitySlots = 4096
 
 // NewMultiTransport builds a MultiTransport over subs. With a single sub it
 // behaves exactly like that sub, so callers can always route through it.
@@ -87,6 +96,11 @@ func (m *MultiTransport) Receive(cb func([]byte)) {
 		s.Receive(func(data []byte) {
 			// Inbound proves this channel is alive end-to-end; clear the streak.
 			m.unackedSince[idx].Store(0)
+			if len(m.subs) > 1 {
+				if h, ok := flowHash(data); ok {
+					m.affinity[h%affinitySlots].Store(uint32(idx) + 1)
+				}
+			}
 			m.mu.RLock()
 			c := m.cb
 			m.mu.RUnlock()
@@ -132,7 +146,8 @@ func (m *MultiTransport) healthy(idx int) bool {
 
 // pick selects a channel for this packet. With one channel it degrades to plain
 // IsConnected (unchanged single-doc behaviour). With several it prefers the
-// flow-hashed channel when healthy (keeps a flow pinned), else round-robins over
+// channel the peer last used for this flow, then the flow-hashed channel when
+// healthy (keeps a flow pinned), else round-robins over
 // any healthy channel, else falls back to any merely-connected channel rather
 // than dropping the packet, else -1 when everything is down.
 func (m *MultiTransport) pick(pkt []byte) int {
@@ -147,6 +162,11 @@ func (m *MultiTransport) pick(pkt []byte) int {
 		return -1
 	}
 	if h, ok := flowHash(pkt); ok {
+		if a := m.affinity[h%affinitySlots].Load(); a != 0 {
+			if idx := int(a - 1); idx < n && m.healthy(idx) {
+				return idx
+			}
+		}
 		idx := int(h % uint32(n))
 		if m.healthy(idx) {
 			return idx

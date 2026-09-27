@@ -287,6 +287,7 @@ DEPRECATED (removed in v2)
 	// SAME documents in the SAME order. A single URL yields a single sub, so
 	// the MultiTransport wrapper is transparent in that case.
 	docURLs := splitDocURLs(globalDocUrl)
+	codecApplied := false
 
 	switch *transportType {
 	case "vyandex":
@@ -313,7 +314,20 @@ DEPRECATED (removed in v2)
 	case "cupsonline":
 		inner = cupsonline.NewCupsonlineTransport(globalDocUrl, config, *role != roleExit)
 	case "mailru":
-		inner = mailru.NewMailruDocsTransport(globalDocUrl, config)
+		// Several Mail.ru documents: the codec wraps each channel and the
+		// MultiTransport sits outside it, so it sees raw IP packets and can pin
+		// flows (a batched frame mixes flows and can't be pinned).
+		if len(docURLs) > 1 {
+			subs := make([]transport.Transport, len(docURLs))
+			for i, u := range docURLs {
+				subs[i] = applyCodec(*codec, mailru.NewMailruDocsTransport(u, config))
+			}
+			inner = transport.NewMultiTransport(subs)
+			codecApplied = true
+			log.Printf("Multi-document: %d Mail.ru channels", len(subs))
+		} else {
+			inner = mailru.NewMailruDocsTransport(globalDocUrl, config)
+		}
 	default:
 		log.Fatalf("Unknown transport type: %s", *transportType)
 	}
@@ -324,10 +338,11 @@ DEPRECATED (removed in v2)
 	switch *codec {
 	case codecBatched:
 		log.Printf("Codec: batched (zstd + coalescing)")
-		inner = transport.NewBatchedTransport(inner)
 	case codecLegacy:
 		log.Printf("Codec: legacy (per-packet LZ4, no batching)")
-		inner = transport.NewCompressedTransport(inner)
+	}
+	if !codecApplied {
+		inner = applyCodec(*codec, inner)
 	}
 
 	// Optional AES-256-GCM encryption sits closest to the raw transport, so on
@@ -463,6 +478,14 @@ func runClientTUN(trans transport.Transport) {
 	tc.RestoreDefault()
 	log.Printf("Shutdown complete")
 	os.Exit(0)
+}
+
+// applyCodec wraps t in the app-layer codec selected by --codec.
+func applyCodec(codec string, t transport.Transport) transport.Transport {
+	if codec == codecLegacy {
+		return transport.NewCompressedTransport(t)
+	}
+	return transport.NewBatchedTransport(t)
 }
 
 // splitDocURLs parses a --url value that may hold several documents separated
