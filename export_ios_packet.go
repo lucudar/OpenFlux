@@ -11,6 +11,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"runtime/debug"
@@ -284,6 +285,32 @@ func OpenFluxTunReadPacket(buf *C.char, max C.int) C.int {
 	}
 }
 
+// OpenFluxTunTryReadPacket is OpenFluxTunReadPacket without blocking: it
+// returns 0 at once when no packet is queued. Lets the extension hand iOS
+// several packets per writePackets call.
+//
+//export OpenFluxTunTryReadPacket
+func OpenFluxTunTryReadPacket(buf *C.char, max C.int) C.int {
+	ptMu.Lock()
+	outQ := ptOutQ
+	ptMu.Unlock()
+	if outQ == nil {
+		return 0
+	}
+	select {
+	case data := <-outQ:
+		n := len(data)
+		if n > int(max) {
+			n = int(max)
+		}
+		dst := unsafe.Slice((*byte)(unsafe.Pointer(buf)), int(max))
+		copy(dst[:n], data[:n])
+		return C.int(n)
+	default:
+		return 0
+	}
+}
+
 // OpenFluxPacketTunnelConnected reports whether the packet-tunnel transport
 // currently has a live connection. Returns 1 when running and the underlying
 // transport reports connected, 0 otherwise (stopped, or mid-reconnect).
@@ -376,12 +403,79 @@ func handleDNSPacket(req []byte, outQ chan []byte) {
 	}
 }
 
+// Answers are cached for their TTL, and one DoT connection is kept open for
+// reuse: previously every lookup did its own TCP+TLS handshake, which kept the
+// radio awake and cost a lot of battery.
+var (
+	dnsCache = network.NewDNSCache(512)
+	dotMu    sync.Mutex
+	dotConn  net.Conn
+	dotUsed  time.Time
+)
+
+// dotIdle is how long an idle DoT connection is trusted for reuse; resolvers
+// close idle connections, and a stale one would just cost a failed round trip.
+const dotIdle = 15 * time.Second
+
 // dnsOverTLS sends a DNS query to a DoT resolver (RFC 7858, length-prefixed)
-// and returns the raw DNS answer, trying each server in turn.
+// and returns the raw DNS answer, from the cache when possible.
 func dnsOverTLS(query []byte) ([]byte, error) {
+	if ans := dnsCache.Get(query); ans != nil {
+		return ans, nil
+	}
+	ans, err := dotResolve(query)
+	if err == nil {
+		dnsCache.Put(query, ans)
+	}
+	return ans, err
+}
+
+// dotResolve uses the shared connection when it is free; a query that finds
+// it busy does a one-off exchange instead of queueing behind a slow lookup.
+func dotResolve(query []byte) ([]byte, error) {
+	if !dotMu.TryLock() {
+		return dotOneOff(query)
+	}
+	defer dotMu.Unlock()
+	if dotConn != nil {
+		if time.Since(dotUsed) < dotIdle {
+			if ans, err := dotExchange(dotConn, query); err == nil {
+				dotUsed = time.Now()
+				return ans, nil
+			}
+		}
+		dotConn.Close()
+		dotConn = nil
+	}
 	var lastErr error
 	for _, s := range dotServers {
-		ans, err := dotQueryOne(s, query)
+		conn, err := dotDial(s)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		ans, err := dotExchange(conn, query)
+		if err != nil {
+			conn.Close()
+			lastErr = err
+			continue
+		}
+		dotConn, dotUsed = conn, time.Now()
+		return ans, nil
+	}
+	return nil, lastErr
+}
+
+func dotOneOff(query []byte) ([]byte, error) {
+	var lastErr error
+	for _, s := range dotServers {
+		conn, err := dotDial(s)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		ans, err := dotExchange(conn, query)
+		conn.Close()
 		if err == nil {
 			return ans, nil
 		}
@@ -390,16 +484,15 @@ func dnsOverTLS(query []byte) ([]byte, error) {
 	return nil, lastErr
 }
 
-func dotQueryOne(s dotServer, query []byte) ([]byte, error) {
+func dotDial(s dotServer) (net.Conn, error) {
 	d := tls.Dialer{
 		NetDialer: &net.Dialer{Timeout: 6 * time.Second},
 		Config:    &tls.Config{ServerName: s.sni, MinVersion: tls.VersionTLS12},
 	}
-	conn, err := d.DialContext(context.Background(), "tcp", s.addr)
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
+	return d.DialContext(context.Background(), "tcp", s.addr)
+}
+
+func dotExchange(conn net.Conn, query []byte) ([]byte, error) {
 	conn.SetDeadline(time.Now().Add(6 * time.Second))
 
 	var lp [2]byte
@@ -414,6 +507,9 @@ func dotQueryOne(s dotServer, query []byte) ([]byte, error) {
 	ans := make([]byte, binary.BigEndian.Uint16(hdr))
 	if _, err := io.ReadFull(conn, ans); err != nil {
 		return nil, err
+	}
+	if len(ans) < 2 || ans[0] != query[0] || ans[1] != query[1] {
+		return nil, errors.New("dns: mismatched answer id")
 	}
 	return ans, nil
 }

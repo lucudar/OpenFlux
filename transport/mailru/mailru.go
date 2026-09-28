@@ -69,7 +69,16 @@ type MailruDocsTransport struct {
 // NewMailruDocsTransport accepts either a bare weblink ("AbCdEfGh1/IjKlMnOp2")
 // or a full public URL ("https://cloud.mail.ru/public/AbCdEfGh1/IjKlMnOp2"),
 // normalizing the latter to the former.
+// keepAliveInterval for Mail.ru: the server's own socket.io pings already keep
+// the WebSocket open, and every keep-alive is relayed to the peer, so a short
+// interval mostly keeps the phone's radio awake. 25s still spots a dead link
+// well inside the app's reconnect grace.
+const keepAliveInterval = 25 * time.Second
+
 func NewMailruDocsTransport(weblink string, config transport.TransportConfig) *MailruDocsTransport {
+	if config.KeepAliveInterval < keepAliveInterval {
+		config.KeepAliveInterval = keepAliveInterval
+	}
 	t := &MailruDocsTransport{
 		BaseTransport: transport.NewBaseTransport(config),
 		weblink:       normalizeWeblink(weblink),

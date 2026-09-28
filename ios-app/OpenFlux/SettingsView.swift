@@ -37,7 +37,11 @@ struct SettingsView: View {
                     Button("Готово") { dismiss() }
                 }
             }
-            .onAppear { OpenFluxSetDebug(debugLog ? 1 : 0) }
+            .onAppear {
+                OpenFluxSetDebug(debugLog ? 1 : 0)
+                vpn.logVisible = true
+            }
+            .onDisappear { vpn.logVisible = false }
             .confirmationDialog("Удалить VPN-конфигурацию из iOS?",
                                 isPresented: $confirmReset, titleVisibility: .visible) {
                 Button("Сбросить", role: .destructive) { vpn.resetConfiguration() }

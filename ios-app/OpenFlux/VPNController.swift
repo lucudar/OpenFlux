@@ -22,6 +22,11 @@ final class VPNController: ObservableObject {
     private var managerCount = 0
     /// Poll counter, used to rate-limit the app-side channel diagnostics.
     private var polls = 0
+    /// The log is only pulled while something shows it (the settings screen);
+    /// re-reading the file every 2s otherwise just burns battery.
+    var logVisible = false {
+        didSet { if logVisible != oldValue { refreshStatus() } }
+    }
 
     /// App Group shared with the packet-tunnel extension. The extension writes
     /// its diagnostic log to a file in this container; we read it directly,
@@ -240,8 +245,9 @@ final class VPNController: ObservableObject {
         case .reasserting:   status = "Reasserting…";  active = true
         default:             status = "Disconnected";  active = false
         }
-        // Poll the extension for its diagnostic log while there is a session.
-        if conn.status == .disconnected || conn.status == .invalid {
+        // Poll the extension for its diagnostic log while there is a session
+        // and the log is on screen.
+        if conn.status == .disconnected || conn.status == .invalid || !logVisible {
             stopLogPolling()
         } else {
             startLogPolling()

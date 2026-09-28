@@ -325,16 +325,21 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     /// traffic" zombie state.
     private func startHealthMonitor() {
         let timer = DispatchSource.makeTimerSource(queue: monitorQueue)
-        // 3s cadence: dense enough to capture the availMem trend before an iOS
-        // memory kill and to see transport flaps, without flooding the log.
-        timer.schedule(deadline: .now() + 3, repeating: 3)
+        // 10s cadence with generous leeway so iOS can coalesce the wake-up
+        // with other work: a 3s timer plus a log write per tick kept the CPU
+        // waking all day and was a big battery cost. Dead-link detection still
+        // lands well inside deadTransportGrace (>= 15s).
+        timer.schedule(deadline: .now() + 10, repeating: 10, leeway: .seconds(3))
         timer.setEventHandler { [weak self] in
             guard let self = self else { return }
             let connected = OpenFluxPacketTunnelConnected() != 0
             let mem = self.availMemMB()
             self.healthTick += 1
-            // Always log the memory + connection trace while diagnosing drops.
-            self.diag("health connected=\(connected) availMem=\(mem)MB tick=\(self.healthTick)")
+            // Log on a state change, when memory runs low, and otherwise once
+            // every ~5 min: a file write per tick was pure battery cost.
+            if connected != self.lastConnState || mem < 20 || self.healthTick % 30 == 0 {
+                self.diag("health connected=\(connected) availMem=\(mem)MB tick=\(self.healthTick)")
+            }
             if mem < 12 {
                 self.diag("LOW MEMORY availMem=\(mem)MB — near iOS extension kill threshold")
             }
@@ -432,17 +437,34 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
-    /// Go stack -> device.
+    /// Go stack -> device. Blocks for the first packet, then drains whatever
+    /// else is already queued so iOS gets one writePackets call per burst
+    /// instead of one per packet (each call is a syscall into the kernel).
     private func startWriteLoop() {
         DispatchQueue.global(qos: .userInitiated).async {
             let maxLen: Int32 = 4096
+            let maxBatch = 64
             let buf = UnsafeMutablePointer<CChar>.allocate(capacity: Int(maxLen))
             defer { buf.deallocate() }
+            let proto = NSNumber(value: AF_INET)
+            var packets: [Data] = []
+            var protos: [NSNumber] = []
+            packets.reserveCapacity(maxBatch)
+            protos.reserveCapacity(maxBatch)
             while true {
                 let n = OpenFluxTunReadPacket(buf, maxLen)
                 if n <= 0 { break }
-                let data = Data(bytes: buf, count: Int(n))
-                self.packetFlow.writePackets([data], withProtocols: [NSNumber(value: AF_INET)])
+                packets.append(Data(bytes: buf, count: Int(n)))
+                protos.append(proto)
+                while packets.count < maxBatch {
+                    let m = OpenFluxTunTryReadPacket(buf, maxLen)
+                    if m <= 0 { break }
+                    packets.append(Data(bytes: buf, count: Int(m)))
+                    protos.append(proto)
+                }
+                self.packetFlow.writePackets(packets, withProtocols: protos)
+                packets.removeAll(keepingCapacity: true)
+                protos.removeAll(keepingCapacity: true)
             }
         }
     }
